@@ -104,9 +104,13 @@ test('default effort labels stay short without changing effort selection',()=>{
 });
 test('manifest and both language resources ship with all runtime parts',()=>{
  const pkg=JSON.parse(read('package.json'));assert.equal(pkg.engines.dsh,'0.2.2-rc.3');assert.equal(pkg.dsh.client.platform,'web');assert.equal(pkg.dsh.bundle.patch,'./cordis.patch.yml');
- assert.equal(pkg.license,'MIT'); assert.equal(pkg.private,true);
+ assert.equal(pkg.license,'MIT'); assert.equal(pkg.private,undefined);
+  assert.equal(pkg.name,'@leonchan2840/dsh-quick-model-panel');
+  assert.equal(pkg.publishConfig.access,'public'); assert.equal(pkg.publishConfig.registry,'https://registry.npmjs.org/');
+  assert.equal(pkg.repository.url,'git+https://github.com/leonchan2840/dsh-quick-model-panel.git');
+  assert.match(read('cordis.patch.yml'),new RegExp("name: '"+pkg.name+"'"));
  for (const name of ['index.js','client.js','icon.svg','README.md','LICENSE','SECURITY.md','cordis.patch.yml','locale/en.json','locale/zh.json']) assert.ok(read(name).length>0);
- assert.deepEqual(pkg.files,['index.js','client.js','cordis.patch.yml','locale/*.json','icon.svg','README.md','LICENSE','SECURITY.md']);
+ assert.deepEqual(pkg.files,['index.js','client.js','cordis.patch.yml','locale/*.json','icon.svg','README.md','LICENSE','SECURITY.md','docs/images/*.png','build.cjs','src','test']);
  for (const file of ['src/view-locales.json','src/host-locales.json']) {const d=JSON.parse(read(file));assert.deepEqual(Object.keys(d.zh).sort(),Object.keys(d.en).sort());}
  for (const lang of ['en','zh']){const d=JSON.parse(read('locale/'+lang+'.json')).meta;assert.ok(d.title&&d.description);}
 });

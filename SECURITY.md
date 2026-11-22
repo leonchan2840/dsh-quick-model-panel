@@ -25,5 +25,5 @@
 
 - 提交前检查实际文件清单；`.gitignore` 只阻止新文件被加入，不能移除已经跟踪的秘密，GitHub 网页上传也不会自动遵守本地忽略规则。
 - 不上传 `.playwright-mcp/`、日志、`.env*`、私钥、缓存及用户配置。运行时包使用 `package.json` 的 `files` 白名单。
-- 保留 `private: true` 防止误发 npm；它不限制 GitHub 开源。源代码和构建产物以 MIT 许可发布，详情见 [LICENSE](./LICENSE)。
+- 此发行版移除 `private: true`，通过 `publishConfig` 指定公开 npm 注册表与公开访问。打包与检查不等于发布；正式执行发布前仍应确认账号、包名、版本及实际包内容。源代码和构建产物以 MIT 许可发布，详情见 [LICENSE](./LICENSE)。
 - 发布前运行 `node build.cjs` 和 `node --test`，确认 [client.js](./client.js) 与源码一致。
