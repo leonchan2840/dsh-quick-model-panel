@@ -1,0 +1,24 @@
+# 本地依赖、测试结果、浏览器调试资料不进入开源仓库。
+node_modules/
+.playwright-mcp/
+coverage/
+*.log
+*.tgz
+*.zip
+release/
+
+# 防止误加本地凭据；发布前仍需人工审查。
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 本机编辑器/系统文件。
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# client.js 是可直接安装的构建产物，必须提交。

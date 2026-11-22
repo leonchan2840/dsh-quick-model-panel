@@ -1,0 +1,14 @@
+{
+  "zh": {
+    "host.team": "智能体团队协作", "host.on": "已开启", "host.off": "已关闭", "host.cancel": "保持开启",
+    "host.confirmTitle": "关闭团队协作", "host.confirmBody": "当前会话已经使用过模型。关闭团队协作后，已有的任务和子智能体会保留。确定关闭吗？",
+    "host.storage": "星标没有保存：当前浏览器的本地存储不可用。", "host.stale": "星标列表已变化，请重新选择。",
+    "host.failed": "设置未保存，请重试。", "host.default": "默认"
+  },
+  "en": {
+    "host.team": "Agent team collaboration", "host.on": "On", "host.off": "Off", "host.cancel": "Keep enabled",
+    "host.confirmTitle": "Turn off team collaboration", "host.confirmBody": "This session has already used a model. Existing tasks and subagents will be kept. Turn off team collaboration?",
+    "host.storage": "Stars were not saved: local browser storage is unavailable.", "host.stale": "Stars have changed. Choose again.",
+    "host.failed": "Settings were not saved. Please retry.", "host.default": "Default"
+  }
+}

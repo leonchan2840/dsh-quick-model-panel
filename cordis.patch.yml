@@ -1,0 +1,3 @@
+- insert:
+    - id: quick-model-panel
+      name: '@local/dsh-quick-model-panel'
