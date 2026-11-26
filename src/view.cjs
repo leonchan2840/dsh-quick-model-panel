@@ -1,11 +1,13 @@
 'use strict';
 
-// 先按两层的总宽度定位，避免只因触发按钮靠右就把二级菜单翻到左边。
+// 双栏优先贴近入口；窗口虽够宽但会把主层挪远时，改用同位二级层。
 function horizontalLayout(viewport, anchor, expanded) {
   const width = Math.max(1, Math.min(340, viewport - 16));
-  const side = expanded && viewport >= 16 + width + 8 + 340 ? 'right' : 'inside';
-  const occupied = side === 'right' ? width + 8 + 340 : width;
-  return { width, side, left: Math.max(8, Math.min(anchor, viewport - occupied - 8)) };
+  const twoColumns = viewport >= 16 + width + 8 + 340;
+  const twoColumnLeft = Math.max(8, Math.min(anchor, viewport - width - 8 - 340 - 8));
+  // 仅因理论上放得下，不应将入口右侧的主面板硬挪走超过一整栏。
+  const side = expanded && twoColumns && anchor - twoColumnLeft <= width ? 'right' : 'inside';
+  return { width, side, left: side === 'right' ? twoColumnLeft : Math.max(8, Math.min(anchor, viewport - width - 8)) };
 }
 
 // 打开前预留双栏宽；右侧完整目录保留独立视口预算，不随主层收藏内容变化。
@@ -38,6 +40,12 @@ function containsEvent(event, roots) {
 // 只隔离鼠标/指针的冒泡，不 preventDefault：按钮、输入、range 与键盘保持原生行为。
 function stopComposerEvent(event) { event.stopPropagation(); }
 function remoteBlocked(locked, pending, busy) { return !!(locked || pending || busy); }
+// 同名原生 radio 组只有选中的一项进入 Tab 顺序；聚焦陷阱不可把其余项当作末尾。
+function tabStops(elements) {
+  const chosen = new Map();
+  for (const el of elements) if (el.type === 'radio' && el.name && (el.checked || !chosen.has(el.name))) chosen.set(el.name, el);
+  return elements.filter(el => el.type !== 'radio' || !el.name || chosen.get(el.name) === el);
+}
 // 请求仍会由宿主正常完成，但旧请求不能关闭后来重新打开的搜索层。
 function shouldCloseSearch(requestEpoch, currentEpoch, panelOpen, searchOpen) {
   return requestEpoch === currentEpoch && !!panelOpen && !!searchOpen;
@@ -83,9 +91,10 @@ function createView(React, createPortal) {
 
   return function QuickPanel(props) {
     const { modelName, models = [], current, favs = [], onStar, onSelect, levels = [], effortIndex,
-      onEffort, onMove, maxFavorites, teamNode, locked, pending, loading, error, reload, t, onOpen } = props;
+      onEffort, onMove, maxFavorites, teamNode, settingsNode, locked, pending, loading, error, reload, t, onOpen } = props;
     const [open, setOpen] = useState(false);
     const [searchOpen, setSearchOpen] = useState(false);
+    const [settingsOpen, setSettingsOpen] = useState(false);
     const [query, setQuery] = useState('');
     const [channel, setChannel] = useState('');
     const [drag, setDrag] = useState(null);
@@ -100,16 +109,17 @@ function createView(React, createPortal) {
     const primaryTopRef = useRef(null);
     const rootRef = useRef(null), triggerRef = useRef(null), panelRef = useRef(null);
     const searchRef = useRef(null), searchButtonRef = useRef(null), inputRef = useRef(null);
+    const settingsRef = useRef(null), settingsButtonRef = useRef(null);
     const mounted = useRef(false), inFlight = useRef(false), previewRef = useRef(effortIndex);
-    const editing = useRef(false), openRef = useRef(false), searchOpenRef = useRef(false), searchEpoch = useRef(0);
+    const editing = useRef(false), openRef = useRef(false), searchOpenRef = useRef(false), settingsOpenRef = useRef(false), searchEpoch = useRef(0);
     const latest = useRef(props); latest.current = props;
     // 档位 ID 属于提供方，不假定其不含分隔符；二义签名会漏掉目录变更。
     const levelSignature = JSON.stringify(levels.map((level) => level.id));
-    const roots = () => [rootRef.current, panelRef.current, searchRef.current];
+    const roots = () => [rootRef.current, panelRef.current, searchRef.current, settingsRef.current];
     const isolation = { onPointerDown: stopComposerEvent, onMouseDown: stopComposerEvent, onClick: stopComposerEvent,
       'data-composer-overlay': true };
     const uid = useId();
-    const panelId = uid + '-panel', searchId = uid + '-search', effortId = uid + '-effort';
+    const panelId = uid + '-panel', searchId = uid + '-search', settingsId = uid + '-settings', effortId = uid + '-effort';
     const translate = (key) => t('qmp.' + key);
     const favoritePairs = favs.filter((m, i, all) => all.findIndex((x) => same(x, m)) === i).slice(0, maxFavorites);
     const favoriteModels = favoritePairs.map((pair) => models.find((m) => same(m, pair)) || { ...pair, name: pair.id, missing: true });
@@ -221,15 +231,22 @@ function createView(React, createPortal) {
       setSearchOpen(false); setReplacement(null);
       if (restore && searchButtonRef.current) searchButtonRef.current.focus({ preventScroll: true });
     }
+    function closeSettings(restore) {
+      settingsOpenRef.current = false; setSettingsOpen(false);
+      if (restore) settingsButtonRef.current?.focus({ preventScroll: true });
+    }
     function closePanel(restore) {
       openRef.current = false;
-      cancelDrag(); setOpen(false); setPosition(null); closeSearch(false); setQuery(''); setChannel('');
+      cancelDrag(); setOpen(false); setPosition(null); closeSearch(false); closeSettings(false); setQuery(''); setChannel('');
       editing.current = false; previewRef.current = effortIndex; setPreview(effortIndex);
       if (restore && triggerRef.current) triggerRef.current.focus({ preventScroll: true });
     }
     function showSearch() {
       searchEpoch.current++;
-      cancelDrag(); searchOpenRef.current = true; setSearchOpen(true); setReplacement(null);
+      closeSettings(false); cancelDrag(); searchOpenRef.current = true; setSearchOpen(true); setReplacement(null);
+    }
+    function showSettings() {
+      closeSearch(false); cancelDrag(); settingsOpenRef.current = true; setSettingsOpen(true);
     }
     // 父级以 sessionId 为 key 重挂载；异步完成后不可更新已卸载会话或重开浮层。
     useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -261,9 +278,9 @@ function createView(React, createPortal) {
         if (!containsEvent(event, roots())) closePanel(false);
       };
       const escape = (event) => {
-        if (event.key !== 'Escape') return;
+        if (event.key !== 'Escape' || !containsEvent(event, roots())) return;
         event.preventDefault(); event.stopPropagation();
-        if (dragRef.current) cancelDrag(); else if (searchOpenRef.current) closeSearch(true); else closePanel(true);
+        if (dragRef.current) cancelDrag(); else if (searchOpenRef.current) closeSearch(true); else if (settingsOpenRef.current) closeSettings(true); else closePanel(true);
       };
       doc.addEventListener('pointerdown', outside, true);
       doc.addEventListener('keydown', escape, true);
@@ -294,15 +311,18 @@ function createView(React, createPortal) {
     }, [open, position]);
     const primary = primaryGeometry(position, primaryHeight, primaryTopRef.current);
     const panelReady = !!position && primaryHeight !== null;
-    const replaceFirst = useRef(null), replaceTrigger = useRef(null), previousSearch = useRef(false);
+    const replaceFirst = useRef(null), replaceTrigger = useRef(null), previousSide = useRef('');
     useEffect(() => {
       // 等首次测量解除隐藏再交接焦点；普通内容增高不能再次抢走当前控件焦点。
-      if (!open || !panelReady) { previousSearch.current = false; return; }
-      if (searchOpen) inputRef.current?.focus({ preventScroll: true });
-      else if (previousSearch.current) searchButtonRef.current?.focus({ preventScroll: true });
+      if (!open || !panelReady) { previousSide.current = ''; return; }
+      const side = searchOpen ? 'search' : settingsOpen ? 'settings' : '';
+      if (side === 'search') inputRef.current?.focus({ preventScroll: true });
+      else if (side === 'settings') settingsRef.current?.focus({ preventScroll: true });
+      else if (previousSide.current === 'search') searchButtonRef.current?.focus({ preventScroll: true });
+      else if (previousSide.current === 'settings') settingsButtonRef.current?.focus({ preventScroll: true });
       else panelRef.current?.focus({ preventScroll: true });
-      previousSearch.current = searchOpen;
-    }, [open, searchOpen, panelReady]);
+      previousSide.current = side;
+    }, [open, searchOpen, settingsOpen, panelReady]);
     useEffect(() => { if (replacement) replaceFirst.current?.focus({ preventScroll: true }); }, [replacement]);
     function leaveReplacement() {
       setReplacement(null);
@@ -381,9 +401,9 @@ function createView(React, createPortal) {
     }
     function trapTab(event) {
       if (!openRef.current || event.key !== 'Tab') return;
-      const scope = searchOpenRef.current ? searchRef.current : panelRef.current;
+      const scope = searchOpenRef.current ? searchRef.current : settingsOpenRef.current ? settingsRef.current : panelRef.current;
       if (!scope) return;
-      const nodes = Array.from(scope.querySelectorAll(focusable)).filter((el) => el.getClientRects().length);
+      const nodes = tabStops(Array.from(scope.querySelectorAll(focusable)).filter((el) => el.getClientRects().length));
       if (!nodes.length) { event.preventDefault(); scope.focus({ preventScroll: true }); return; }
       const first = nodes[0], last = nodes[nodes.length - 1], active = scope.ownerDocument.activeElement;
       if (event.shiftKey && (active === first || !nodes.includes(active))) { event.preventDefault(); last.focus({ preventScroll: true }); }
@@ -450,6 +470,14 @@ function createView(React, createPortal) {
           h('header', { className: 'dsh-qmp-header' }, h('strong', null, translate('title')),
             h('span', { className: 'dsh-qmp-status' + (!locked && !loading && (busy || pending) ? ' is-saving' : ''), role: 'status' },
               locked ? translate('locked') : loading ? translate('loading') : (busy || pending) ? translate('saving') : ''),
+            settingsNode ? h('button', { type: 'button', className: 'dsh-qmp-icon', ref: settingsButtonRef,
+              'aria-label': t('host.settings'), title: t('host.settings'), 'aria-expanded': settingsOpen,
+              'aria-controls': settingsOpen ? settingsId : undefined,
+              onClick: () => settingsOpen ? closeSettings(true) : showSettings() },
+              h('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+                strokeWidth: 1.75, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+                h('path', { d: 'M9.8 3.2h4.4l.5 2.2c.6.2 1.1.5 1.6.9l2.1-.8 2.2 3.8-1.6 1.5c.1.8.1 1.6 0 2.4l1.6 1.5-2.2 3.8-2.1-.8c-.5.4-1 .7-1.6.9l-.5 2.2H9.8l-.5-2.2c-.6-.2-1.1-.5-1.6-.9l-2.1.8-2.2-3.8L5 13.2a9 9 0 0 1 0-2.4L3.4 9.3l2.2-3.8 2.1.8c.5-.4 1-.7 1.6-.9l.5-2.2Z' }),
+                h('circle', { cx: 12, cy: 12, r: 2.7 }))) : null,
             h('button', { type: 'button', className: 'dsh-qmp-icon', 'aria-label': translate('close'), onClick: () => closePanel(true) }, '×')),
           !searchOpen && errorNotice(),
           h('div', { className: 'dsh-qmp-section-heading' }, h('span', null, translate('favorites')),
@@ -474,6 +502,15 @@ function createView(React, createPortal) {
               h('div', { className: 'dsh-qmp-range-labels', 'aria-hidden': true }, levels.map((level, index) =>
                 h('span', { key: level.id, className: index === safePreview ? 'is-active' : '' }, level.label)))) : null),
           teamNode ? h('div', { className: 'dsh-qmp-team' }, teamNode) : null),
+        settingsOpen && settingsNode ? h('section', { ...isolation, id: settingsId, ref: settingsRef, tabIndex: -1,
+          style: position ? { position: 'fixed', top: primary.top,
+            maxHeight: Math.max(1, position.viewportHeight - primary.top - 8),
+            left: position.side === 'right' ? position.left + position.width + 8 : position.left,
+            width: position.width } : { visibility: 'hidden' },
+          className: 'dsh-qmp-settings-panel', role: 'dialog', 'aria-label': t('host.settings') },
+          h('header', { className: 'dsh-qmp-header' }, h('strong', null, t('host.settings')),
+            h('button', { type: 'button', className: 'dsh-qmp-icon', 'aria-label': translate('back'), onClick: () => closeSettings(true) }, '×')),
+          settingsNode) : null,
         searchOpen ? h('section', { ...isolation, id: searchId, ref: searchRef, tabIndex: -1,
           style: position ? { position: 'fixed', top: position.top, height: position.height, maxHeight: position.height,
             left: position.side === 'right' ? position.left + position.width + 8 : position.left,
@@ -505,4 +542,4 @@ function createView(React, createPortal) {
   };
 }
 
-module.exports = { triggerSummary, providerLabel, shouldCloseSearch, groupChannels, favoriteDrop, createView, horizontalLayout, panelLayout, primaryGeometry, sameLayout, containsEvent, stopComposerEvent, remoteBlocked };
+module.exports = { triggerSummary, providerLabel, shouldCloseSearch, groupChannels, favoriteDrop, createView, horizontalLayout, panelLayout, primaryGeometry, sameLayout, containsEvent, stopComposerEvent, remoteBlocked, tabStops };

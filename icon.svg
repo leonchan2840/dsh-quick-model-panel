@@ -1,6 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-  <g fill="none" stroke="#577fac" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
-    <path d="M8 12h5m6 0h9M8 23h11m6 0h3"/>
-    <rect x="13" y="8.5" width="6" height="7" rx="2"/><rect x="19" y="19.5" width="6" height="7" rx="2"/>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" width="36" height="36" fill="none">
+  <title>实心列表条 · 石墨＋青（带进度填充）</title>
+  <rect x="7" y="7.5" width="15" height="3" rx="1.5" fill="#111827"/>
+  <path d="M27 5l1.1 2.3 2.5.35-1.8 1.75.43 2.48L27 10.7l-2.23 1.18.43-2.48-1.8-1.75 2.5-.35z" fill="#0EA5E9"/>
+  <rect x="7" y="14.5" width="12" height="3" rx="1.5" fill="#94A3B8"/>
+  <circle cx="27" cy="16" r="1.4" fill="#94A3B8"/>
+  <rect x="7" y="21.5" width="14" height="3" rx="1.5" fill="#94A3B8"/>
+  <circle cx="27" cy="23" r="1.4" fill="#94A3B8"/>
+  <rect x="7" y="28.25" width="22" height="2.5" rx="1.25" fill="#E2E8F0"/>
+  <rect x="7" y="28.25" width="8" height="2.5" rx="1.25" fill="#0EA5E9"/>
+  <circle cx="15" cy="29.5" r="3.2" fill="#0EA5E9"/>
+  <circle cx="15" cy="29.5" r="1.1" fill="#FFFFFF"/>
 </svg>

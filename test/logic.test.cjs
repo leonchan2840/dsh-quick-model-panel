@@ -44,7 +44,7 @@ test('levels reject malformed entries and duplicate IDs, retain native order', (
 test('selection retains supported current effort over target default', () => {
   assert.deepEqual(selectionFor(model(reasoning), 'high'), { provider: 'p', model: 'm', reasoningEffort: 'high' });
 });
-test('selection uses target default when previous effort is unsupported or unset', () => {
+test('unsupported or unset preference explicitly selects the advertised target default', () => {
   for (const value of ['other', undefined, null]) {
     assert.deepEqual(selectionFor(model(reasoning), value), { provider: 'p', model: 'm', reasoningEffort: 'low' });
   }

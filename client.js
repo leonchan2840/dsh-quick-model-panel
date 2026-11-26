@@ -48,7 +48,7 @@ function levelsFor(model) {
   return result;
 }
 
-// 显示当前档与切换模型共用同一规则，避免滑块显示和提交参数分别维护而漂移。
+// 展示档位时区分已保存的档位和当前模型声明的默认档位。
 function resolveEffort(model, currentEffort) {
   const levels = levelsFor(model);
   const supports = id => levels.some(level => level.id === id);
@@ -57,13 +57,21 @@ function resolveEffort(model, currentEffort) {
   return { levels, fallback, effective: supports(currentEffort) ? currentEffort : fallback };
 }
 
-function selectionFor(model, currentEffort) {
+function selectionFor(model, preferredEffort) {
   const pair = pairOf(model);
   if (!pair) throw new TypeError('A model requires non-empty provider and id');
-  const { effective } = resolveEffort(model, currentEffort);
-  // 无显式默认档时留给 provider；不能将列表第一档伪造为默认档。
-  return { provider: pair.provider, model: pair.id,
-    ...(effective === undefined ? {} : { reasoningEffort: effective }) };
+  // 跨模型偏好只在目标模型支持时覆盖；否则提交目标模型声明的有效默认档，与原生选模型一致。
+  const { effective } = resolveEffort(model, preferredEffort);
+  return { provider: pair.provider, model: pair.id, ...(effective === undefined ? {} : { reasoningEffort: effective }) };
+}
+
+function effortOptions(models) {
+  const options = new Map();
+  for (const model of models) for (const level of levelsFor(model)) {
+    // ID 是 DSH 的真实档位标识；跨渠道同一个 ID 只出现一次。
+    if (!options.has(level.id)) options.set(level.id, level);
+  }
+  return [...options.values()];
 }
 
 /**
@@ -163,18 +171,20 @@ function createFavorites(storage, key = FAVORITES_KEY) {
   };
 }
 
-module.exports = { FAVORITES_KEY, MAX_FAVORITES, normalizeModels, levelsFor, resolveEffort, selectionFor, createFavorites };
+module.exports = { FAVORITES_KEY, MAX_FAVORITES, normalizeModels, levelsFor, resolveEffort, selectionFor, effortOptions, createFavorites };
 
 return module.exports;})();
     const { createView } = (function(){const module={exports:{}};
 'use strict';
 
-// 先按两层的总宽度定位，避免只因触发按钮靠右就把二级菜单翻到左边。
+// 双栏优先贴近入口；窗口虽够宽但会把主层挪远时，改用同位二级层。
 function horizontalLayout(viewport, anchor, expanded) {
   const width = Math.max(1, Math.min(340, viewport - 16));
-  const side = expanded && viewport >= 16 + width + 8 + 340 ? 'right' : 'inside';
-  const occupied = side === 'right' ? width + 8 + 340 : width;
-  return { width, side, left: Math.max(8, Math.min(anchor, viewport - occupied - 8)) };
+  const twoColumns = viewport >= 16 + width + 8 + 340;
+  const twoColumnLeft = Math.max(8, Math.min(anchor, viewport - width - 8 - 340 - 8));
+  // 仅因理论上放得下，不应将入口右侧的主面板硬挪走超过一整栏。
+  const side = expanded && twoColumns && anchor - twoColumnLeft <= width ? 'right' : 'inside';
+  return { width, side, left: side === 'right' ? twoColumnLeft : Math.max(8, Math.min(anchor, viewport - width - 8)) };
 }
 
 // 打开前预留双栏宽；右侧完整目录保留独立视口预算，不随主层收藏内容变化。
@@ -207,6 +217,12 @@ function containsEvent(event, roots) {
 // 只隔离鼠标/指针的冒泡，不 preventDefault：按钮、输入、range 与键盘保持原生行为。
 function stopComposerEvent(event) { event.stopPropagation(); }
 function remoteBlocked(locked, pending, busy) { return !!(locked || pending || busy); }
+// 同名原生 radio 组只有选中的一项进入 Tab 顺序；聚焦陷阱不可把其余项当作末尾。
+function tabStops(elements) {
+  const chosen = new Map();
+  for (const el of elements) if (el.type === 'radio' && el.name && (el.checked || !chosen.has(el.name))) chosen.set(el.name, el);
+  return elements.filter(el => el.type !== 'radio' || !el.name || chosen.get(el.name) === el);
+}
 // 请求仍会由宿主正常完成，但旧请求不能关闭后来重新打开的搜索层。
 function shouldCloseSearch(requestEpoch, currentEpoch, panelOpen, searchOpen) {
   return requestEpoch === currentEpoch && !!panelOpen && !!searchOpen;
@@ -252,9 +268,10 @@ function createView(React, createPortal) {
 
   return function QuickPanel(props) {
     const { modelName, models = [], current, favs = [], onStar, onSelect, levels = [], effortIndex,
-      onEffort, onMove, maxFavorites, teamNode, locked, pending, loading, error, reload, t, onOpen } = props;
+      onEffort, onMove, maxFavorites, teamNode, settingsNode, locked, pending, loading, error, reload, t, onOpen } = props;
     const [open, setOpen] = useState(false);
     const [searchOpen, setSearchOpen] = useState(false);
+    const [settingsOpen, setSettingsOpen] = useState(false);
     const [query, setQuery] = useState('');
     const [channel, setChannel] = useState('');
     const [drag, setDrag] = useState(null);
@@ -269,16 +286,17 @@ function createView(React, createPortal) {
     const primaryTopRef = useRef(null);
     const rootRef = useRef(null), triggerRef = useRef(null), panelRef = useRef(null);
     const searchRef = useRef(null), searchButtonRef = useRef(null), inputRef = useRef(null);
+    const settingsRef = useRef(null), settingsButtonRef = useRef(null);
     const mounted = useRef(false), inFlight = useRef(false), previewRef = useRef(effortIndex);
-    const editing = useRef(false), openRef = useRef(false), searchOpenRef = useRef(false), searchEpoch = useRef(0);
+    const editing = useRef(false), openRef = useRef(false), searchOpenRef = useRef(false), settingsOpenRef = useRef(false), searchEpoch = useRef(0);
     const latest = useRef(props); latest.current = props;
     // 档位 ID 属于提供方，不假定其不含分隔符；二义签名会漏掉目录变更。
     const levelSignature = JSON.stringify(levels.map((level) => level.id));
-    const roots = () => [rootRef.current, panelRef.current, searchRef.current];
+    const roots = () => [rootRef.current, panelRef.current, searchRef.current, settingsRef.current];
     const isolation = { onPointerDown: stopComposerEvent, onMouseDown: stopComposerEvent, onClick: stopComposerEvent,
       'data-composer-overlay': true };
     const uid = useId();
-    const panelId = uid + '-panel', searchId = uid + '-search', effortId = uid + '-effort';
+    const panelId = uid + '-panel', searchId = uid + '-search', settingsId = uid + '-settings', effortId = uid + '-effort';
     const translate = (key) => t('qmp.' + key);
     const favoritePairs = favs.filter((m, i, all) => all.findIndex((x) => same(x, m)) === i).slice(0, maxFavorites);
     const favoriteModels = favoritePairs.map((pair) => models.find((m) => same(m, pair)) || { ...pair, name: pair.id, missing: true });
@@ -390,15 +408,22 @@ function createView(React, createPortal) {
       setSearchOpen(false); setReplacement(null);
       if (restore && searchButtonRef.current) searchButtonRef.current.focus({ preventScroll: true });
     }
+    function closeSettings(restore) {
+      settingsOpenRef.current = false; setSettingsOpen(false);
+      if (restore) settingsButtonRef.current?.focus({ preventScroll: true });
+    }
     function closePanel(restore) {
       openRef.current = false;
-      cancelDrag(); setOpen(false); setPosition(null); closeSearch(false); setQuery(''); setChannel('');
+      cancelDrag(); setOpen(false); setPosition(null); closeSearch(false); closeSettings(false); setQuery(''); setChannel('');
       editing.current = false; previewRef.current = effortIndex; setPreview(effortIndex);
       if (restore && triggerRef.current) triggerRef.current.focus({ preventScroll: true });
     }
     function showSearch() {
       searchEpoch.current++;
-      cancelDrag(); searchOpenRef.current = true; setSearchOpen(true); setReplacement(null);
+      closeSettings(false); cancelDrag(); searchOpenRef.current = true; setSearchOpen(true); setReplacement(null);
+    }
+    function showSettings() {
+      closeSearch(false); cancelDrag(); settingsOpenRef.current = true; setSettingsOpen(true);
     }
     // 父级以 sessionId 为 key 重挂载；异步完成后不可更新已卸载会话或重开浮层。
     useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -430,9 +455,9 @@ function createView(React, createPortal) {
         if (!containsEvent(event, roots())) closePanel(false);
       };
       const escape = (event) => {
-        if (event.key !== 'Escape') return;
+        if (event.key !== 'Escape' || !containsEvent(event, roots())) return;
         event.preventDefault(); event.stopPropagation();
-        if (dragRef.current) cancelDrag(); else if (searchOpenRef.current) closeSearch(true); else closePanel(true);
+        if (dragRef.current) cancelDrag(); else if (searchOpenRef.current) closeSearch(true); else if (settingsOpenRef.current) closeSettings(true); else closePanel(true);
       };
       doc.addEventListener('pointerdown', outside, true);
       doc.addEventListener('keydown', escape, true);
@@ -463,15 +488,18 @@ function createView(React, createPortal) {
     }, [open, position]);
     const primary = primaryGeometry(position, primaryHeight, primaryTopRef.current);
     const panelReady = !!position && primaryHeight !== null;
-    const replaceFirst = useRef(null), replaceTrigger = useRef(null), previousSearch = useRef(false);
+    const replaceFirst = useRef(null), replaceTrigger = useRef(null), previousSide = useRef('');
     useEffect(() => {
       // 等首次测量解除隐藏再交接焦点；普通内容增高不能再次抢走当前控件焦点。
-      if (!open || !panelReady) { previousSearch.current = false; return; }
-      if (searchOpen) inputRef.current?.focus({ preventScroll: true });
-      else if (previousSearch.current) searchButtonRef.current?.focus({ preventScroll: true });
+      if (!open || !panelReady) { previousSide.current = ''; return; }
+      const side = searchOpen ? 'search' : settingsOpen ? 'settings' : '';
+      if (side === 'search') inputRef.current?.focus({ preventScroll: true });
+      else if (side === 'settings') settingsRef.current?.focus({ preventScroll: true });
+      else if (previousSide.current === 'search') searchButtonRef.current?.focus({ preventScroll: true });
+      else if (previousSide.current === 'settings') settingsButtonRef.current?.focus({ preventScroll: true });
       else panelRef.current?.focus({ preventScroll: true });
-      previousSearch.current = searchOpen;
-    }, [open, searchOpen, panelReady]);
+      previousSide.current = side;
+    }, [open, searchOpen, settingsOpen, panelReady]);
     useEffect(() => { if (replacement) replaceFirst.current?.focus({ preventScroll: true }); }, [replacement]);
     function leaveReplacement() {
       setReplacement(null);
@@ -550,9 +578,9 @@ function createView(React, createPortal) {
     }
     function trapTab(event) {
       if (!openRef.current || event.key !== 'Tab') return;
-      const scope = searchOpenRef.current ? searchRef.current : panelRef.current;
+      const scope = searchOpenRef.current ? searchRef.current : settingsOpenRef.current ? settingsRef.current : panelRef.current;
       if (!scope) return;
-      const nodes = Array.from(scope.querySelectorAll(focusable)).filter((el) => el.getClientRects().length);
+      const nodes = tabStops(Array.from(scope.querySelectorAll(focusable)).filter((el) => el.getClientRects().length));
       if (!nodes.length) { event.preventDefault(); scope.focus({ preventScroll: true }); return; }
       const first = nodes[0], last = nodes[nodes.length - 1], active = scope.ownerDocument.activeElement;
       if (event.shiftKey && (active === first || !nodes.includes(active))) { event.preventDefault(); last.focus({ preventScroll: true }); }
@@ -619,6 +647,14 @@ function createView(React, createPortal) {
           h('header', { className: 'dsh-qmp-header' }, h('strong', null, translate('title')),
             h('span', { className: 'dsh-qmp-status' + (!locked && !loading && (busy || pending) ? ' is-saving' : ''), role: 'status' },
               locked ? translate('locked') : loading ? translate('loading') : (busy || pending) ? translate('saving') : ''),
+            settingsNode ? h('button', { type: 'button', className: 'dsh-qmp-icon', ref: settingsButtonRef,
+              'aria-label': t('host.settings'), title: t('host.settings'), 'aria-expanded': settingsOpen,
+              'aria-controls': settingsOpen ? settingsId : undefined,
+              onClick: () => settingsOpen ? closeSettings(true) : showSettings() },
+              h('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+                strokeWidth: 1.75, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+                h('path', { d: 'M9.8 3.2h4.4l.5 2.2c.6.2 1.1.5 1.6.9l2.1-.8 2.2 3.8-1.6 1.5c.1.8.1 1.6 0 2.4l1.6 1.5-2.2 3.8-2.1-.8c-.5.4-1 .7-1.6.9l-.5 2.2H9.8l-.5-2.2c-.6-.2-1.1-.5-1.6-.9l-2.1.8-2.2-3.8L5 13.2a9 9 0 0 1 0-2.4L3.4 9.3l2.2-3.8 2.1.8c.5-.4 1-.7 1.6-.9l.5-2.2Z' }),
+                h('circle', { cx: 12, cy: 12, r: 2.7 }))) : null,
             h('button', { type: 'button', className: 'dsh-qmp-icon', 'aria-label': translate('close'), onClick: () => closePanel(true) }, '×')),
           !searchOpen && errorNotice(),
           h('div', { className: 'dsh-qmp-section-heading' }, h('span', null, translate('favorites')),
@@ -643,6 +679,15 @@ function createView(React, createPortal) {
               h('div', { className: 'dsh-qmp-range-labels', 'aria-hidden': true }, levels.map((level, index) =>
                 h('span', { key: level.id, className: index === safePreview ? 'is-active' : '' }, level.label)))) : null),
           teamNode ? h('div', { className: 'dsh-qmp-team' }, teamNode) : null),
+        settingsOpen && settingsNode ? h('section', { ...isolation, id: settingsId, ref: settingsRef, tabIndex: -1,
+          style: position ? { position: 'fixed', top: primary.top,
+            maxHeight: Math.max(1, position.viewportHeight - primary.top - 8),
+            left: position.side === 'right' ? position.left + position.width + 8 : position.left,
+            width: position.width } : { visibility: 'hidden' },
+          className: 'dsh-qmp-settings-panel', role: 'dialog', 'aria-label': t('host.settings') },
+          h('header', { className: 'dsh-qmp-header' }, h('strong', null, t('host.settings')),
+            h('button', { type: 'button', className: 'dsh-qmp-icon', 'aria-label': translate('back'), onClick: () => closeSettings(true) }, '×')),
+          settingsNode) : null,
         searchOpen ? h('section', { ...isolation, id: searchId, ref: searchRef, tabIndex: -1,
           style: position ? { position: 'fixed', top: position.top, height: position.height, maxHeight: position.height,
             left: position.side === 'right' ? position.left + position.width + 8 : position.left,
@@ -674,7 +719,7 @@ function createView(React, createPortal) {
   };
 }
 
-module.exports = { triggerSummary, providerLabel, shouldCloseSearch, groupChannels, favoriteDrop, createView, horizontalLayout, panelLayout, primaryGeometry, sameLayout, containsEvent, stopComposerEvent, remoteBlocked };
+module.exports = { triggerSummary, providerLabel, shouldCloseSearch, groupChannels, favoriteDrop, createView, horizontalLayout, panelLayout, primaryGeometry, sameLayout, containsEvent, stopComposerEvent, remoteBlocked, tabStops };
 
 return module.exports;})();
     const { createPlugin } = (function(){const module={exports:{}};
@@ -683,7 +728,6 @@ return module.exports;})();
 const NS = 'quick-model-panel';
 const SEAT = 'conversation.input.model';
 const same = (selection, model) => !!selection && !!model && selection.provider === model.provider && selection.model === model.id;
-const describe = error => error?.message || String(error);
 
 // 未声明默认档时，“提供方默认”表示省略参数，不等同于最低档。
 function effortState(model, selection, resolveEffort, defaultLabel) {
@@ -716,9 +760,86 @@ function teamDecision(mode, history, to, confirmed) {
   return !to && history.lastUsed !== null && !confirmed ? 'confirm' : 'write';
 }
 
-function createPlugin(React, createPortal, { createView, normalizeModels, resolveEffort, selectionFor, createFavorites, MAX_FAVORITES, FAVORITES_KEY }, dictionaries, css) {
-  const h = React.createElement, { useState, useRef, useEffect, useMemo, useSyncExternalStore } = React;
+function createPlugin(React, createPortal, { createView, normalizeModels, resolveEffort, selectionFor, effortOptions, createFavorites, MAX_FAVORITES, FAVORITES_KEY }, dictionaries, css) {
+  const h = React.createElement, { useId, useState, useRef, useEffect, useMemo, useSyncExternalStore } = React;
   const View = createView(React, createPortal);
+  function SettingsControl({ form, options, t }) {
+    const id = useId();
+    const [saving, setSaving] = useState(false), [failed, setFailed] = useState(false);
+    const active = useRef(false), draftRef = useRef(0), editing = useRef(false), returnFocus = useRef(null);
+    // 保存中会暂时禁用输入；先把焦点交给可聚焦的设置层，避免浏览器把它丢到页面 body。
+    useEffect(() => {
+      if (saving || !returnFocus.current) return;
+      const { scope, input } = returnFocus.current;
+      returnFocus.current = null;
+      if (!scope.isConnected || scope.ownerDocument.activeElement !== scope) return;
+      // 保存失败会把单选框恢复为旧值；不可把焦点放回已不在原生 Tab 顺序中的未选项。
+      const target = input.type === 'radio' && !input.checked
+        ? [...scope.querySelectorAll('input[type="radio"]')].find(el => el.name === input.name && el.checked && !el.disabled)
+        : input;
+      if (target?.isConnected && !target.disabled) target.focus({ preventScroll: true });
+    }, [saving]);
+    const watch = useMemo(() => ({ subscribe: fn => form.subscribe(fn), snapshot: () => form.getSnapshot() }), [form]);
+    const { status, value, writable } = useSyncExternalStore(watch.subscribe, watch.snapshot);
+    const enabled = status === 'ready' && writable;
+    const savedEffort = value?.defaultEffort ?? '';
+    // 复用当前深度的 range 与刻度样式，但这里提交的是未来会话的配置，不改当前会话。
+    const inheritLabel = t('host.inherit');
+    const levels = useMemo(() => [{ id: '', label: inheritLabel },
+      ...(savedEffort && !options.some(level => level.id === savedEffort) ? [{ id: savedEffort, label: savedEffort }] : []), ...options], [options, savedEffort, inheritLabel]);
+    const savedIndex = Math.max(0, levels.findIndex(level => level.id === savedEffort));
+    const [preview, setPreview] = useState(savedIndex);
+    useEffect(() => { editing.current = false; draftRef.current = savedIndex; setPreview(savedIndex); }, [savedIndex, levels]);
+    const index = Math.max(0, Math.min(levels.length - 1, preview));
+    async function save(field, next) {
+      if (!enabled || active.current) return false;
+      active.current = true;
+      const input = typeof document !== 'undefined' ? document.activeElement : null;
+      const scope = input?.closest?.('.dsh-qmp-settings-panel');
+      if (scope && (input?.type === 'radio' || input?.type === 'range')) {
+        returnFocus.current = { scope, input };
+        scope.focus({ preventScroll: true });
+      }
+      setSaving(true); setFailed(false);
+      try { const ok = await form.set(field, next); setFailed(!ok); return ok; }
+      catch { setFailed(true); return false; }
+      finally { active.current = false; setSaving(false); }
+    }
+    function commit() {
+      if (!editing.current) return;
+      editing.current = false;
+      const next = levels[draftRef.current];
+      if (!enabled || active.current || !next || next.id === savedEffort) { setPreview(savedIndex); return; }
+      // 只让表单权威快照驱动成功态；目录变化时旧异步回调不能用旧索引重绘刻度。
+      void save('defaultEffort', next.id).then(ok => { if (!ok && !editing.current) setPreview(savedIndex); });
+    }
+    return h('div', { className: 'dsh-qmp-settings-fields' },
+      h('section', { className: 'dsh-qmp-settings-section' },
+        h('h3', { id: id + '-team' }, t('host.settingsTeam')),
+        h('div', { className: 'dsh-qmp-radio-group', role: 'radiogroup', 'aria-labelledby': id + '-team' },
+          [['on', t('host.on')], ['off', t('host.off')], ['inherit', t('host.inherit')]].map(([option, label]) =>
+            h('label', { className: 'dsh-qmp-radio-option', key: option },
+              h('input', { type: 'radio', name: id + '-team', value: option,
+                checked: (value?.newSessionTeam ?? 'inherit') === option, disabled: !enabled || saving,
+                onChange: () => { if (!active.current) void save('newSessionTeam', option); } }), h('span', null, label))))),
+      h('section', { className: 'dsh-qmp-settings-section' },
+        h('div', { className: 'dsh-qmp-section-heading' },
+          h('label', { id: id + '-effort', htmlFor: id + '-range' }, t('host.settingsEffort')),
+          h('output', { className: 'dsh-qmp-effort-value', htmlFor: id + '-range' }, levels[index].label)),
+        h('input', { id: id + '-range', className: 'dsh-qmp-range', type: 'range', min: 0, max: levels.length - 1,
+          step: 1, value: index, disabled: !enabled || saving || levels.length < 2,
+          'aria-valuetext': levels[index].label, onChange: e => {
+            if (active.current) return;
+            editing.current = true; draftRef.current = Number(e.target.value); setPreview(draftRef.current);
+          }, onPointerDown: e => e.currentTarget.setPointerCapture?.(e.pointerId),
+          onPointerUp: commit, onPointerCancel: () => { editing.current = false; setPreview(savedIndex); },
+          onBlur: commit, onKeyUp: e => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown'].includes(e.key)) commit(); } }),
+        h('div', { className: 'dsh-qmp-range-labels', 'aria-hidden': true }, levels.map((level, i) =>
+          h('span', { key: level.id, className: i === index ? 'is-active' : '' }, level.label)))),
+      h('p', { className: 'dsh-qmp-settings-help' }, t('host.settingsHelp')),
+      failed ? h('p', { className: 'dsh-qmp-settings-feedback', role: 'alert' }, t('host.failed')) :
+        h('p', { className: 'dsh-qmp-settings-feedback', role: 'status' }, saving ? t('qmp.saving') : status === 'loading' ? t('qmp.loading') : !enabled ? t('host.settingsUnavailable') : ''));
+  }
   function TeamControl({ mode, locked, pending, t, change }) {
     const [confirm, setConfirm] = useState(false);
     useEffect(() => { if (!mode.enabled) setConfirm(false); }, [mode.enabled]);
@@ -744,7 +865,7 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     const listedChild = props.useSessions(s => s.byId[props.sessionId]?.origin === 'subagent');
     return child || listedChild || !props.isRoot() ? null : h(Root, { ...props, key: props.sessionId });
   }
-  function Root({ dir, isRoot, setTeam, favStore, t, useProjection, locked }) {
+  function Root({ dir, isRoot, setTeam, favStore, settingsForm, t, useProjection, locked }) {
     const connection = useMemo(() => ({ subscribe: fn => dir.store.subscribe(fn), snapshot: () => dir.store.getSnapshot() }), [dir]);
     const state = useSyncExternalStore(connection.subscribe, connection.snapshot);
     const mode = useProjection('agentTeam'), history = useProjection('modelSelection');
@@ -762,7 +883,7 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     latest.current = { locked, mode, history };
     function reload() {
       if (!isRoot()) return;
-      setError(''); void dir.load().catch(err => { if (alive.current) setError(describe(err)); });
+      setError(''); void dir.load().catch(() => { if (alive.current) setError(t('qmp.operationFailed')); });
     }
     useEffect(() => { alive.current = true; reload(); return () => { alive.current = false; }; }, [dir]);
     function initialize(selection) {
@@ -781,9 +902,9 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
       gate.current = true; setPending(true); setError('');
       try {
         const res = await action();
-        if (!res?.ok) throw new Error(res?.error?.message || t('host.failed'));
+        if (!res?.ok) throw new Error('operation failed');
         return true;
-      } catch (err) { if (alive.current) setError(describe(err)); return false; }
+      } catch { if (alive.current) setError(t('qmp.operationFailed')); return false; }
       finally { gate.current = false; if (alive.current) setPending(false); }
     }
     function onSelect(model) {
@@ -791,9 +912,9 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
       const exact = catalog.find(m => m.provider === model.provider && m.id === model.id);
       if (!exact) return false;
       if (same(now.current, exact)) return true;
-      const oldModel = catalog.find(m => same(now.current, m));
-      const oldEffort = oldModel ? effortState(oldModel, now.current, resolveEffort, '').effective : now.current?.reasoningEffort;
-      return write(() => dir.select(selectionFor(exact, oldEffort)));
+      // 官方切模型不继承旧档；仅在用户明确设置了跨模型默认档时尝试匹配目标模型。
+      const preferred = settingsForm.getSnapshot().status === 'ready' ? settingsForm.getSnapshot().value?.defaultEffort : undefined;
+      return write(() => dir.select(selectionFor(exact, preferred)));
     }
     function onEffort(index) {
       const level = effort.levels[index], now = dir.store.getSnapshot();
@@ -821,14 +942,19 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     }
     const teamNode = mode && typeof mode.enabled === 'boolean' ? h(TeamControl, { mode, t,
       locked: !!locked || history?.lastUsed === undefined, pending: remotePending, change: changeTeam }) : null;
-    const failures = state.failures.map(f => f.name + ': ' + f.message).join('; ');
+    // 提供方错误可能包含私有 URL 或鉴权字段；面板只显示固定文案，不回显异常原文。
+    const failures = state.failures?.length ? t('qmp.operationFailed') : '';
+    const options = useMemo(() => effortOptions(models), [models]);
+    const settingsNode = h(SettingsControl, { form: settingsForm, options, t });
     return h(View, { t, modelName: selected?.name || current?.model, models, current, favs, levels: effort.levels,
-      effortIndex: effort.index, maxFavorites: MAX_FAVORITES, onOpen, onStar, onMove, onSelect, onEffort, teamNode,
-      locked: !!locked, pending: remotePending, error: error || state.error || failures, reload, loading: state.status === 'loading' });
+      effortIndex: effort.index, maxFavorites: MAX_FAVORITES, onOpen, onStar, onMove, onSelect, onEffort, teamNode, settingsNode,
+      locked: !!locked, pending: remotePending, error: error || (state.error ? t('host.failed') : '') || failures, reload, loading: state.status === 'loading' });
   }
-  return { inject: ['slots', 'locale', 'sessions', 'modelDirectories', 'remote', 'remote.agentTeams'], apply(ctx) {
+  return { inject: ['slots', 'locale', 'sessions', 'modelDirectories', 'configForms', 'remote', 'remote.agentTeams'], apply(ctx) {
     ctx.effect(() => ctx.locale.register(NS, dictionaries), 'quick-model-panel: locale');
     const favStore = sharedFavorites({ getItem: k => window.localStorage.getItem(k), setItem: (k,v) => window.localStorage.setItem(k,v) }, createFavorites);
+    const form = ctx.configForms.get(NS);
+    const settingsForm = { subscribe: fn => form.subscribe(fn), getSnapshot: () => form.getSnapshot(), set: (field, value) => form.set(field, value) };
     ctx.effect(() => {
       const listener = e => { if (e.key === FAVORITES_KEY || e.key === null) favStore.refresh(); };
       window.addEventListener('storage', listener); return () => window.removeEventListener('storage', listener);
@@ -836,12 +962,12 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     function StyledSeat(props) { return h(React.Fragment, null, h('style', null, css), h(Seat, props)); }
     ctx.slots.inject(SEAT, () => ctx.slots.register({ name: SEAT, locale: NS, priority: -100,
       inject: sid => ({ dir: ctx.modelDirectories.directoryFor(sid), isRoot: () => ctx.sessions.subagentAddress(sid) === undefined,
-        setTeam: enabled => ctx.remote.agentTeams.setEnabled(sid, enabled), favStore }) }, StyledSeat));
+        setTeam: enabled => ctx.remote.agentTeams.setEnabled(sid, enabled), favStore, settingsForm }) }, StyledSeat));
   } };
 }
 module.exports = { createPlugin, effortState, sharedFavorites, teamDecision };
 
 return module.exports;})();
-    return createPlugin(React, createPortal, {...logic, createView}, {"zh":{"qmp.title":"模型快捷面板","qmp.chooseModel":"选择模型","qmp.close":"关闭面板","qmp.back":"返回快捷面板","qmp.favorites":"星标模型","qmp.allModels":"全部模型","qmp.emptyFavorites":"尚无星标模型。在全部模型中点击 ☆ 添加，最多 7 个。","qmp.star":"添加星标","qmp.unstar":"取消星标","qmp.unavailable":"当前不可用","qmp.search":"搜索模型或 API 渠道","qmp.noModels":"未找到模型","qmp.replaceFavorite":"星标已满，选择要替换的模型","qmp.replace":"替换","qmp.cancel":"取消","qmp.effort":"思考深度","qmp.noEffort":"该模型无可调档位","qmp.locked":"当前不可修改模型设置","qmp.saving":"正在保存…","qmp.loading":"正在加载模型…","qmp.operationFailed":"操作未成功，请重试或重新加载。","qmp.reload":"重新加载","qmp.channel":"API 渠道","qmp.allChannels":"全部渠道","qmp.modelCount":"该渠道下匹配的模型数","qmp.reorder":"调整收藏顺序","qmp.reorderHint":"拖动调整顺序；也可聚焦手柄，用上下方向键移动，Home / End 置顶或置底。","qmp.orderSaved":"收藏顺序已保存","host.team":"智能体团队协作","host.on":"已开启","host.off":"已关闭","host.cancel":"保持开启","host.confirmTitle":"关闭团队协作","host.confirmBody":"当前会话已经使用过模型。关闭团队协作后，已有的任务和子智能体会保留。确定关闭吗？","host.storage":"星标没有保存：当前浏览器的本地存储不可用。","host.stale":"星标列表已变化，请重新选择。","host.failed":"设置未保存，请重试。","host.default":"默认"},"en":{"qmp.title":"Quick model panel","qmp.chooseModel":"Choose model","qmp.close":"Close panel","qmp.back":"Back to quick panel","qmp.favorites":"Starred models","qmp.allModels":"All models","qmp.emptyFavorites":"No starred models yet. Use ☆ in All models to add up to 7.","qmp.star":"Star model","qmp.unstar":"Unstar model","qmp.unavailable":"Unavailable","qmp.search":"Search models or API channels","qmp.noModels":"No models found","qmp.replaceFavorite":"Seven stars already — choose a model to replace","qmp.replace":"Replace","qmp.cancel":"Cancel","qmp.effort":"Reasoning effort","qmp.noEffort":"No adjustable effort for this model","qmp.locked":"Model settings cannot be changed right now","qmp.saving":"Saving…","qmp.loading":"Loading models…","qmp.operationFailed":"The operation failed. Try again or reload.","qmp.reload":"Reload","qmp.channel":"API channel","qmp.allChannels":"All channels","qmp.modelCount":"Matching models in this channel","qmp.reorder":"Reorder favorite","qmp.reorderHint":"Drag to reorder, or focus this handle and use Up/Down. Home/End moves to the start/end.","qmp.orderSaved":"Favorite order saved","host.team":"Agent team collaboration","host.on":"On","host.off":"Off","host.cancel":"Keep enabled","host.confirmTitle":"Turn off team collaboration","host.confirmBody":"This session has already used a model. Existing tasks and subagents will be kept. Turn off team collaboration?","host.storage":"Stars were not saved: local browser storage is unavailable.","host.stale":"Stars have changed. Choose again.","host.failed":"Settings were not saved. Please retry.","host.default":"Default"}}, "/* 浮层使用宿主中性实体表面，避免半透明菜单叠加后串色；几何定位由 view 统一计算。 */\n.dsh-qmp {\n  --qmp-bg: var(--dsw-alias-bg-layer-2, Canvas);\n  --qmp-surface: var(--dsw-alias-bg-module-platform, Canvas);\n  --qmp-fg: var(--dsw-alias-label-primary, CanvasText);\n  --qmp-muted: var(--dsw-alias-label-secondary, GrayText);\n  --qmp-border: var(--dsw-alias-border-l2, ButtonBorder);\n  --qmp-accent: var(--dsw-alias-state-business-primary, Highlight);\n  --qmp-hover: color-mix(in srgb, var(--qmp-fg) 5%, var(--qmp-bg));\n  --qmp-selected: color-mix(in srgb, var(--qmp-accent) 9%, var(--qmp-bg));\n  position: relative;\n  display: inline-flex;\n  min-width: 0;\n  max-width: 100%;\n  color: var(--qmp-fg);\n  font-family: var(--dsw-font-family, system-ui, sans-serif);\n  font-size: 13px;\n  line-height: 1.45;\n  text-align: start;\n  -webkit-font-smoothing: antialiased;\n}\n.dsh-qmp *, .dsh-qmp *::before, .dsh-qmp *::after { box-sizing: border-box; }\n/* 显式清除 UA 按钮与 search 外观，不把 reset 泄漏到宿主组件。 */\n.dsh-qmp button, .dsh-qmp input {\n  appearance: none;\n  -webkit-appearance: none;\n  font: inherit;\n  letter-spacing: inherit;\n  color: inherit;\n  margin: 0;\n}\n.dsh-qmp button {\n  border: 0;\n  background: transparent;\n  padding: 0;\n  text-align: inherit;\n  cursor: pointer;\n  -webkit-tap-highlight-color: transparent;\n  transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease;\n}\n.dsh-qmp button:disabled, .dsh-qmp input:disabled { opacity: .45; cursor: not-allowed; }\n.dsh-qmp button:focus-visible, .dsh-qmp input:focus-visible, .dsh-qmp [tabindex]:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--qmp-accent));\n  outline-offset: 2px;\n}\n.dsh-qmp .dsh-qmp-trigger {\n  display: inline-flex;\n  align-items: center;\n  gap: 7px;\n  max-width: 100%;\n  min-height: 30px;\n  padding: 5px 9px;\n  border-radius: 7px;\n  color: var(--qmp-muted);\n}\n.dsh-qmp .dsh-qmp-trigger:hover, .dsh-qmp .dsh-qmp-trigger[aria-expanded=\"true\"] { background: var(--qmp-hover); color: var(--qmp-fg); }\n/* 模型名优先省略，为当前档位留出独立空间；极长档位也不能挤出输入框。 */\n.dsh-qmp-trigger-label { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-trigger-effort { flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-trigger-chevron { flex: 0 0 auto; font-size: 11px; color: var(--qmp-muted); }\n/* Portal 不制造覆盖整页的透明命中层；真正的浮层自己参与命中。 */\n.dsh-qmp-portal { position: static; }\n.dsh-qmp-panel, .dsh-qmp-search {\n  margin: 0;\n  padding: 0;\n  inset: auto;\n  min-width: 0;\n  border: 0;\n  border-radius: 13px;\n  color: var(--qmp-fg);\n  background: var(--qmp-bg);\n  box-shadow: var(--dsw-elevation-panel, 0 0 0 1px var(--qmp-border));\n  z-index: 1101;\n  outline: none;\n  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-thumb-l2, var(--qmp-border));\n  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-thumb-hover-l2, var(--qmp-muted));\n}\n.dsh-qmp-panel { display: flex; flex-direction: column; }\n/* 按内容展开；只在实际窗口装不下时收缩收藏列表，深度和团队入口不跟着滚走。 */\n.dsh-qmp-primary { display: flex; flex-direction: column; flex: 1 1 auto; width: 100%; min-width: 0; min-height: 0; max-height: inherit; padding: 14px 10px 10px; overflow-y: auto; overscroll-behavior: contain; border-radius: inherit; }\n.dsh-qmp-primary > * { flex-shrink: 0; }\n.dsh-qmp-primary > .dsh-qmp-favorites { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px; }\n.dsh-qmp-header, .dsh-qmp-section-heading { display: flex; gap: 7px; align-items: center; }\n.dsh-qmp-header { justify-content: space-between; min-height: 28px; padding: 0 4px; margin-bottom: 13px; }\n.dsh-qmp-header strong { font-size: 14px; line-height: 21px; font-weight: 600; letter-spacing: -.15px; }\n.dsh-qmp .dsh-qmp-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex: 0 0 28px; border-radius: 6px; font-size: 20px; line-height: 1; font-weight: 400; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-icon:hover { background: var(--qmp-hover); color: var(--qmp-fg); }\n.dsh-qmp-section-heading { min-height: 26px; margin: 0 4px 7px; color: var(--qmp-muted); font-size: 12px; line-height: 16px; font-weight: 500; }\n.dsh-qmp-count { color: var(--qmp-muted); font-size: 11px; font-variant-numeric: tabular-nums; opacity: .85; }\n.dsh-qmp .dsh-qmp-text-button { padding: 5px 7px; border-radius: 5px; font-size: 12px; line-height: 16px; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-text-button:hover, .dsh-qmp .dsh-qmp-text-button[aria-expanded=\"true\"] { color: var(--qmp-accent); background: var(--qmp-selected); }\n.dsh-qmp-section-heading > .dsh-qmp-text-button { margin-inline-start: auto; }\n.dsh-qmp-row { display: flex; align-items: stretch; gap: 2px; min-height: 54px; margin: 2px 0; border: 0; border-radius: 8px; }\n.dsh-qmp-row:hover { background: var(--qmp-hover); }\n.dsh-qmp-row.is-current, .dsh-qmp-row.is-current:hover { background: var(--qmp-selected); }\n.dsh-qmp .dsh-qmp-model { display: grid; grid-template-columns: minmax(0, 1fr) 18px; grid-template-rows: 20px 16px; align-content: center; column-gap: 8px; text-align: start; flex: 1 1 auto; min-width: 0; padding: 8px 9px; border-radius: 7px; }\n.dsh-qmp-model-name { grid-column: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 500; letter-spacing: -.12px; }\n.dsh-qmp-provider { grid-column: 1; color: var(--qmp-muted); font-size: 12px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-check { display: flex; align-items: center; justify-content: center; grid-column: 2; grid-row: 1 / 3; align-self: center; color: var(--qmp-accent); font-size: 13px; font-weight: 600; }\n/* 收藏只改变图形实心/空心，不挪动行或改变当前模型的选中底色。按钮保留完整热区。 */\n.dsh-qmp .dsh-qmp-star { align-self: center; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 36px; width: 36px; height: 36px; margin-inline-end: 4px; border-radius: 7px; font-family: system-ui, sans-serif; font-size: 18px; line-height: 1; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-star:hover { background: color-mix(in srgb, var(--qmp-fg) 8%, transparent); color: var(--qmp-fg); }\n.dsh-qmp .dsh-qmp-star[aria-pressed=\"true\"] { color: var(--qmp-accent); }\n.dsh-qmp-effort, .dsh-qmp-team { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--qmp-border); }\n.dsh-qmp-effort-value { margin-inline-start: auto; color: var(--qmp-fg); font-size: 12px; font-weight: 500; text-align: end; }\n.dsh-qmp .dsh-qmp-range { display: block; width: calc(100% - 16px); height: 22px; margin: 2px 8px; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: pointer; accent-color: var(--qmp-accent); }\n.dsh-qmp-range::-webkit-slider-runnable-track { height: 3px; border-radius: 99px; corner-shape: round; background: color-mix(in srgb, var(--qmp-fg) 14%, var(--qmp-bg)); }\n.dsh-qmp-range::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 13px; height: 13px; margin-top: -5px; border: 2px solid var(--qmp-bg); border-radius: 50%; corner-shape: round; background: var(--qmp-accent); box-shadow: 0 0 0 1px var(--qmp-accent); }\n.dsh-qmp-range::-moz-range-track { height: 3px; border-radius: 99px; background: color-mix(in srgb, var(--qmp-fg) 14%, var(--qmp-bg)); }\n.dsh-qmp-range::-moz-range-thumb { width: 10px; height: 10px; border: 2px solid var(--qmp-bg); border-radius: 50%; background: var(--qmp-accent); box-shadow: 0 0 0 1px var(--qmp-accent); }\n/* 两端各半格，内部整格：标签中心对应 range 的等距停靠点；端点向内排字避免溢出。 */\n.dsh-qmp-range-labels { display: flex; gap: 0; margin: 3px 14px 0; color: var(--qmp-muted); font-size: 11px; line-height: 16px; }\n.dsh-qmp-range-labels span { flex: 1; min-width: 0; text-align: center; overflow-wrap: anywhere; }\n.dsh-qmp-range-labels span:first-child { flex: .5; text-align: start; }\n.dsh-qmp-range-labels span:last-child { flex: .5; text-align: end; }\n.dsh-qmp-range-labels span:only-child { flex: 1; text-align: center; }\n.dsh-qmp-range-labels .is-active { color: var(--qmp-accent); font-weight: 600; }\n.dsh-qmp .dsh-qmp-team-toggle { display: flex; width: 100%; min-height: 36px; gap: 12px; align-items: center; justify-content: space-between; padding: 4px 6px; border-radius: 7px; }\n.dsh-qmp .dsh-qmp-team-toggle:hover:not(:disabled) { background: var(--qmp-hover); }\n.dsh-qmp-team-label { font-size: 12px; font-weight: 500; }\n.dsh-qmp-switch-track { position: relative; display: block; flex: 0 0 30px; width: 30px; height: 18px; padding: 3px; border-radius: 99px; corner-shape: round; background: color-mix(in srgb, var(--qmp-fg) 24%, var(--qmp-bg)); transition: background-color 120ms ease; }\n.dsh-qmp-switch-thumb { display: block; width: 12px; height: 12px; border-radius: 50%; corner-shape: round; background: var(--dsw-alias-switch-thumb, Canvas); box-shadow: var(--dsw-shadow-lv1, none); }\n.dsh-qmp-team-toggle[aria-checked=\"true\"] .dsh-qmp-switch-track { background: var(--qmp-accent); }\n.dsh-qmp-team-toggle[aria-checked=\"true\"] .dsh-qmp-switch-thumb { margin-inline-start: 12px; background: var(--dsw-alias-label-on-color, Canvas); }\n.dsh-qmp-team-confirm { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; padding: 9px; border-radius: 7px; background: var(--qmp-surface); }\n.dsh-qmp-team-confirm p { width: 100%; margin: 0 0 3px; color: var(--qmp-muted); font-size: 12px; }\n.dsh-qmp-team-confirm button { padding: 5px 8px; border-radius: 5px; background: var(--qmp-bg); font-size: 12px; }\n.dsh-qmp-team-confirm button:hover { box-shadow: 0 0 0 1px var(--qmp-border); }\n.dsh-qmp-hint { color: var(--qmp-muted); font-size: 12px; line-height: 20px; margin: 10px 7px; }\n.dsh-qmp-status { flex: 1; min-width: 0; text-align: end; color: var(--qmp-muted); font-size: 12px; line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n/* 很快完成的会话写入无需闪出一帧“正在保存”；长请求仍有可见反馈，不改变标题栏几何。 */\n.dsh-qmp-status.is-saving { animation: dsh-qmp-saving 1ms linear 160ms backwards; }\n@keyframes dsh-qmp-saving { from { opacity: 0; } to { opacity: 1; } }\n.dsh-qmp-error { display: flex; gap: 6px; align-items: center; height: 36px; margin: 5px 4px 0; padding: 5px 7px; border-radius: 6px; background: var(--qmp-surface); font-size: 12px; line-height: 16px; }\n.dsh-qmp-error span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n/* 右列高度/位置是独立视口预算，不继承收藏内容高度，也不做位置动画。 */\n.dsh-qmp-search { display: flex; flex-direction: column; padding: 14px 10px 10px; }\n.dsh-qmp-search .dsh-qmp-header { flex: 0 0 28px; margin-bottom: 10px; }\n.dsh-qmp-query-wrap { position: relative; flex: 0 0 36px; margin: 0 4px; }\n.dsh-qmp-query-wrap::before { content: ''; pointer-events: none; position: absolute; width: 16px; height: 16px; inset-inline-start: 10px; top: 10px; background: var(--qmp-muted); mask: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5'%3E%3Ccircle cx='6.8' cy='6.8' r='4.5'/%3E%3Cpath d='m10.2 10.2 3.5 3.5'/%3E%3C/svg%3E\") center / contain no-repeat; }\n.dsh-qmp .dsh-qmp-query { display: block; width: 100%; height: 36px; padding: 8px 10px 8px 33px; border: 0; border-radius: 7px; color: var(--qmp-fg); background: var(--qmp-surface); font-size: 12px; line-height: 20px; }\n.dsh-qmp-query::placeholder { color: var(--qmp-muted); opacity: 1; }\n.dsh-qmp-query::-webkit-search-decoration { -webkit-appearance: none; }\n.dsh-qmp-query::-webkit-search-cancel-button { cursor: pointer; }\n.dsh-qmp-results { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin-top: 10px; }\n.dsh-qmp-replace { padding: 9px; margin: 10px 4px 0; border-radius: 8px; background: var(--qmp-surface); max-height: 48%; overflow-y: auto; flex-shrink: 0; font-size: 12px; line-height: 17px; }\n.dsh-qmp-replace p { margin: 0 0 6px; font-weight: 500; }\n.dsh-qmp .dsh-qmp-replace-option { display: block; width: 100%; text-align: start; border-radius: 5px; margin: 3px 0; padding: 6px 7px; overflow-wrap: anywhere; }\n.dsh-qmp-replace-option:hover { color: var(--qmp-accent); background: var(--qmp-selected); }\n/* 渠道使用实体底色、强调边与标题层级，滚动时保留所属渠道；不靠微小副标题区分。 */\n.dsh-qmp-channel { margin: 0 2px 14px; border: 1px solid var(--qmp-border); border-radius: 9px; }\n.dsh-qmp-channel:last-child { margin-bottom: 2px; }\n.dsh-qmp-channel-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 9px; border-inline-start: 3px solid var(--qmp-accent); border-bottom: 1px solid var(--qmp-border); border-radius: 8px 8px 0 0; background: var(--qmp-surface); }\n.dsh-qmp-channel-badge { flex: 0 0 auto; color: var(--qmp-accent); background: var(--qmp-selected); padding: 4px; border-radius: 5px; font-size: 10px; font-weight: 700; }\n.dsh-qmp-channel-name { display: flex; flex: 1; flex-direction: column; min-width: 0; }\n.dsh-qmp-channel-name strong { font-size: 14px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-channel-name > span { color: var(--qmp-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-channel-count { flex: 0 0 auto; min-width: 24px; padding: 2px 5px; border-radius: 5px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--qmp-fg); background: var(--qmp-bg); }\n.dsh-qmp-channel > .dsh-qmp-row { margin: 3px; }\n.dsh-qmp-channel-filter { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; margin: 8px 4px 0; font-size: 12px; color: var(--qmp-muted); }\n.dsh-qmp-channel-filter > span { flex: 0 0 auto; }\n.dsh-qmp-channel-filter select { font: inherit; color: var(--qmp-fg); background: var(--qmp-surface); min-width: 0; flex: 1; height: 30px; border: 1px solid var(--qmp-border); border-radius: 6px; padding: 3px 6px; }\n.dsh-qmp-channel-filter select:focus-visible { outline: 2px solid var(--qmp-accent); outline-offset: 1px; }\n/* 排序手柄与选模型、星标三者热区分离；插入线不占位，不因拖动重排触发误点。 */\n.dsh-qmp .dsh-qmp-drag { flex: 0 0 26px; width: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: var(--qmp-muted); cursor: grab; touch-action: none; user-select: none; }\n.dsh-qmp .dsh-qmp-drag:hover { background: var(--qmp-hover); color: var(--qmp-fg); }\n.dsh-qmp .is-dragging .dsh-qmp-drag { cursor: grabbing; color: var(--qmp-accent); }\n.dsh-qmp-row.is-dragging { outline: 1px dashed var(--qmp-accent); outline-offset: -1px; }\n.dsh-qmp-row.drop-before { box-shadow: 0 -2px 0 var(--qmp-accent); }\n.dsh-qmp-row.drop-after { box-shadow: 0 2px 0 var(--qmp-accent); }\n.dsh-qmp-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }\n@media (max-width: 420px) {\n  .dsh-qmp-primary, .dsh-qmp-search { padding: 10px 8px 8px; }\n  .dsh-qmp .dsh-qmp-star { flex-basis: 40px; width: 40px; height: 40px; }\n  .dsh-qmp .dsh-qmp-icon { width: 32px; height: 32px; }\n  .dsh-qmp .dsh-qmp-query { font-size: 16px; }\n}\n@media (prefers-reduced-motion: reduce) { .dsh-qmp button, .dsh-qmp-switch-track { transition: none; } .dsh-qmp-status.is-saving { animation: none; } }\n@media (forced-colors: active) {\n  .dsh-qmp-panel, .dsh-qmp-search { outline: 1px solid CanvasText; }\n  .dsh-qmp-row.is-current { outline: 1px solid Highlight; outline-offset: -1px; }\n  .dsh-qmp .dsh-qmp-star[aria-pressed=\"true\"] { color: Highlight; }\n  .dsh-qmp-switch-track { outline: 1px solid ButtonText; }\n  .dsh-qmp-switch-thumb { background: ButtonText; }\n  .dsh-qmp-range::-webkit-slider-runnable-track { background: ButtonText; }\n  .dsh-qmp-range::-webkit-slider-thumb { background: Highlight; border-color: Canvas; }\n}\n");
+    return createPlugin(React, createPortal, {...logic, createView}, {"zh":{"qmp.title":"模型快捷面板","qmp.chooseModel":"选择模型","qmp.close":"关闭面板","qmp.back":"返回快捷面板","qmp.favorites":"星标模型","qmp.allModels":"全部模型","qmp.emptyFavorites":"尚无星标模型。在全部模型中点击 ☆ 添加，最多 7 个。","qmp.star":"添加星标","qmp.unstar":"取消星标","qmp.unavailable":"当前不可用","qmp.search":"搜索模型或 API 渠道","qmp.noModels":"未找到模型","qmp.replaceFavorite":"星标已满，选择要替换的模型","qmp.replace":"替换","qmp.cancel":"取消","qmp.effort":"思考深度","qmp.noEffort":"该模型无可调档位","qmp.locked":"当前不可修改模型设置","qmp.saving":"正在保存…","qmp.loading":"正在加载模型…","qmp.operationFailed":"操作未成功，请重试或重新加载。","qmp.reload":"重新加载","qmp.channel":"API 渠道","qmp.allChannels":"全部渠道","qmp.modelCount":"该渠道下匹配的模型数","qmp.reorder":"调整收藏顺序","qmp.reorderHint":"拖动调整顺序；也可聚焦手柄，用上下方向键移动，Home / End 置顶或置底。","qmp.orderSaved":"收藏顺序已保存","host.team":"智能体团队协作","host.on":"开启","host.off":"关闭","host.cancel":"保持开启","host.confirmTitle":"关闭团队协作","host.confirmBody":"当前会话已经使用过模型。关闭团队协作后，已有的任务和子智能体会保留。确定关闭吗？","host.storage":"星标没有保存：当前浏览器的本地存储不可用。","host.stale":"星标列表已变化，请重新选择。","host.failed":"设置未保存，请重试。","host.default":"默认","host.settings":"设置","host.inherit":"跟随系统","host.settingsTeam":"新会话默认团队协作","host.settingsEffort":"默认思考深度","host.settingsHelp":"已开始的会话不回改；模型不支持所选深度时用模型默认。切回跟随系统不会清除之前空白草稿中已写入的默认值。","host.settingsUnavailable":"当前 DSH 配置不接受设置写入。"},"en":{"qmp.title":"Quick model panel","qmp.chooseModel":"Choose model","qmp.close":"Close panel","qmp.back":"Back to quick panel","qmp.favorites":"Starred models","qmp.allModels":"All models","qmp.emptyFavorites":"No starred models yet. Use ☆ in All models to add up to 7.","qmp.star":"Star model","qmp.unstar":"Unstar model","qmp.unavailable":"Unavailable","qmp.search":"Search models or API channels","qmp.noModels":"No models found","qmp.replaceFavorite":"Seven stars already — choose a model to replace","qmp.replace":"Replace","qmp.cancel":"Cancel","qmp.effort":"Reasoning effort","qmp.noEffort":"No adjustable effort for this model","qmp.locked":"Model settings cannot be changed right now","qmp.saving":"Saving…","qmp.loading":"Loading models…","qmp.operationFailed":"The operation failed. Try again or reload.","qmp.reload":"Reload","qmp.channel":"API channel","qmp.allChannels":"All channels","qmp.modelCount":"Matching models in this channel","qmp.reorder":"Reorder favorite","qmp.reorderHint":"Drag to reorder, or focus this handle and use Up/Down. Home/End moves to the start/end.","qmp.orderSaved":"Favorite order saved","host.team":"Agent team collaboration","host.on":"On","host.off":"Off","host.cancel":"Keep enabled","host.confirmTitle":"Turn off team collaboration","host.confirmBody":"This session has already used a model. Existing tasks and subagents will be kept. Turn off team collaboration?","host.storage":"Stars were not saved: local browser storage is unavailable.","host.stale":"Stars have changed. Choose again.","host.failed":"Settings were not saved. Please retry.","host.default":"Default","host.settings":"Settings","host.inherit":"Follow system","host.settingsTeam":"New session agent teams","host.settingsEffort":"Default reasoning effort","host.settingsHelp":"Started sessions stay unchanged. Unsupported efforts fall back to the model default. Follow system cannot erase defaults already saved to a blank draft.","host.settingsUnavailable":"This DSH profile does not accept settings writes."}}, "/* 浮层使用宿主中性实体表面，避免半透明菜单叠加后串色；几何定位由 view 统一计算。 */\n.dsh-qmp {\n  --qmp-bg: var(--dsw-alias-bg-layer-2, Canvas);\n  --qmp-surface: var(--dsw-alias-bg-module-platform, Canvas);\n  --qmp-fg: var(--dsw-alias-label-primary, CanvasText);\n  --qmp-muted: var(--dsw-alias-label-secondary, GrayText);\n  --qmp-border: var(--dsw-alias-border-l2, ButtonBorder);\n  --qmp-accent: var(--dsw-alias-state-business-primary, Highlight);\n  --qmp-hover: color-mix(in srgb, var(--qmp-fg) 5%, var(--qmp-bg));\n  --qmp-selected: color-mix(in srgb, var(--qmp-accent) 9%, var(--qmp-bg));\n  position: relative;\n  display: inline-flex;\n  min-width: 0;\n  max-width: 100%;\n  color: var(--qmp-fg);\n  font-family: var(--dsw-font-family, system-ui, sans-serif);\n  font-size: 13px;\n  line-height: 1.45;\n  text-align: start;\n  -webkit-font-smoothing: antialiased;\n}\n.dsh-qmp *, .dsh-qmp *::before, .dsh-qmp *::after { box-sizing: border-box; }\n/* 显式清除 UA 按钮与 search 外观，不把 reset 泄漏到宿主组件。 */\n.dsh-qmp button, .dsh-qmp input {\n  appearance: none;\n  -webkit-appearance: none;\n  font: inherit;\n  letter-spacing: inherit;\n  color: inherit;\n  margin: 0;\n}\n.dsh-qmp button {\n  border: 0;\n  background: transparent;\n  padding: 0;\n  text-align: inherit;\n  cursor: pointer;\n  -webkit-tap-highlight-color: transparent;\n  transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease;\n}\n.dsh-qmp button:disabled, .dsh-qmp input:disabled { opacity: .45; cursor: not-allowed; }\n.dsh-qmp button:focus-visible, .dsh-qmp input:focus-visible, .dsh-qmp [tabindex]:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--qmp-accent));\n  outline-offset: 2px;\n}\n.dsh-qmp .dsh-qmp-trigger {\n  display: inline-flex;\n  align-items: center;\n  gap: 7px;\n  max-width: 100%;\n  min-height: 30px;\n  padding: 5px 9px;\n  border-radius: 7px;\n  color: var(--qmp-muted);\n}\n.dsh-qmp .dsh-qmp-trigger:hover, .dsh-qmp .dsh-qmp-trigger[aria-expanded=\"true\"] { background: var(--qmp-hover); color: var(--qmp-fg); }\n/* 模型名优先省略，为当前档位留出独立空间；极长档位也不能挤出输入框。 */\n.dsh-qmp-trigger-label { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-trigger-effort { flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-trigger-chevron { flex: 0 0 auto; font-size: 11px; color: var(--qmp-muted); }\n/* Portal 不制造覆盖整页的透明命中层；真正的浮层自己参与命中。 */\n.dsh-qmp-portal { position: static; }\n.dsh-qmp-panel, .dsh-qmp-search, .dsh-qmp-settings-panel {\n  margin: 0;\n  padding: 0;\n  inset: auto;\n  min-width: 0;\n  border: 0;\n  border-radius: 13px;\n  color: var(--qmp-fg);\n  background: var(--qmp-bg);\n  box-shadow: var(--dsw-elevation-panel, 0 0 0 1px var(--qmp-border));\n  z-index: 1101;\n  outline: none;\n  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-thumb-l2, var(--qmp-border));\n  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-thumb-hover-l2, var(--qmp-muted));\n}\n.dsh-qmp-panel { display: flex; flex-direction: column; }\n/* 按内容展开；只在实际窗口装不下时收缩收藏列表，深度和团队入口不跟着滚走。 */\n.dsh-qmp-primary { display: flex; flex-direction: column; flex: 1 1 auto; width: 100%; min-width: 0; min-height: 0; max-height: inherit; padding: 14px 10px 10px; overflow-y: auto; overscroll-behavior: contain; border-radius: inherit; }\n.dsh-qmp-primary > * { flex-shrink: 0; }\n.dsh-qmp-primary > .dsh-qmp-favorites { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px; }\n.dsh-qmp-header, .dsh-qmp-section-heading { display: flex; gap: 7px; align-items: center; }\n.dsh-qmp-header { justify-content: space-between; min-height: 28px; padding: 0 4px; margin-bottom: 13px; }\n.dsh-qmp-header strong { font-size: 14px; line-height: 21px; font-weight: 600; letter-spacing: -.15px; }\n.dsh-qmp .dsh-qmp-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex: 0 0 28px; border-radius: 6px; font-size: 20px; line-height: 1; font-weight: 400; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-icon:hover { background: var(--qmp-hover); color: var(--qmp-fg); }\n.dsh-qmp-section-heading { min-height: 26px; margin: 0 4px 7px; color: var(--qmp-muted); font-size: 12px; line-height: 16px; font-weight: 500; }\n.dsh-qmp-count { color: var(--qmp-muted); font-size: 11px; font-variant-numeric: tabular-nums; opacity: .85; }\n.dsh-qmp .dsh-qmp-text-button { padding: 5px 7px; border-radius: 5px; font-size: 12px; line-height: 16px; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-text-button:hover, .dsh-qmp .dsh-qmp-text-button[aria-expanded=\"true\"] { color: var(--qmp-accent); background: var(--qmp-selected); }\n.dsh-qmp-section-heading > .dsh-qmp-text-button { margin-inline-start: auto; }\n.dsh-qmp-row { display: flex; align-items: stretch; gap: 2px; min-height: 54px; margin: 2px 0; border: 0; border-radius: 8px; }\n.dsh-qmp-row:hover { background: var(--qmp-hover); }\n.dsh-qmp-row.is-current, .dsh-qmp-row.is-current:hover { background: var(--qmp-selected); }\n.dsh-qmp .dsh-qmp-model { display: grid; grid-template-columns: minmax(0, 1fr) 18px; grid-template-rows: 20px 16px; align-content: center; column-gap: 8px; text-align: start; flex: 1 1 auto; min-width: 0; padding: 8px 9px; border-radius: 7px; }\n.dsh-qmp-model-name { grid-column: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 500; letter-spacing: -.12px; }\n.dsh-qmp-provider { grid-column: 1; color: var(--qmp-muted); font-size: 12px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-check { display: flex; align-items: center; justify-content: center; grid-column: 2; grid-row: 1 / 3; align-self: center; color: var(--qmp-accent); font-size: 13px; font-weight: 600; }\n/* 收藏只改变图形实心/空心，不挪动行或改变当前模型的选中底色。按钮保留完整热区。 */\n.dsh-qmp .dsh-qmp-star { align-self: center; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 36px; width: 36px; height: 36px; margin-inline-end: 4px; border-radius: 7px; font-family: system-ui, sans-serif; font-size: 18px; line-height: 1; color: var(--qmp-muted); }\n.dsh-qmp .dsh-qmp-star:hover { background: color-mix(in srgb, var(--qmp-fg) 8%, transparent); color: var(--qmp-fg); }\n.dsh-qmp .dsh-qmp-star[aria-pressed=\"true\"] { color: var(--qmp-accent); }\n.dsh-qmp-effort, .dsh-qmp-team { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--qmp-border); }\n.dsh-qmp-effort-value { margin-inline-start: auto; color: var(--qmp-fg); font-size: 12px; font-weight: 500; text-align: end; }\n.dsh-qmp .dsh-qmp-range { display: block; width: calc(100% - 16px); height: 22px; margin: 2px 8px; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: pointer; accent-color: var(--qmp-accent); }\n.dsh-qmp-range::-webkit-slider-runnable-track { height: 3px; border-radius: 99px; corner-shape: round; background: color-mix(in srgb, var(--qmp-fg) 14%, var(--qmp-bg)); }\n.dsh-qmp-range::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 13px; height: 13px; margin-top: -5px; border: 2px solid var(--qmp-bg); border-radius: 50%; corner-shape: round; background: var(--qmp-accent); box-shadow: 0 0 0 1px var(--qmp-accent); }\n.dsh-qmp-range::-moz-range-track { height: 3px; border-radius: 99px; background: color-mix(in srgb, var(--qmp-fg) 14%, var(--qmp-bg)); }\n.dsh-qmp-range::-moz-range-thumb { width: 10px; height: 10px; border: 2px solid var(--qmp-bg); border-radius: 50%; background: var(--qmp-accent); box-shadow: 0 0 0 1px var(--qmp-accent); }\n/* 两端各半格，内部整格：标签中心对应 range 的等距停靠点；端点向内排字避免溢出。 */\n.dsh-qmp-range-labels { display: flex; gap: 0; margin: 3px 14px 0; color: var(--qmp-muted); font-size: 11px; line-height: 16px; }\n.dsh-qmp-range-labels span { flex: 1; min-width: 0; text-align: center; overflow-wrap: anywhere; }\n.dsh-qmp-range-labels span:first-child { flex: .5; text-align: start; }\n.dsh-qmp-range-labels span:last-child { flex: .5; text-align: end; }\n.dsh-qmp-range-labels span:only-child { flex: 1; text-align: center; }\n.dsh-qmp-range-labels .is-active { color: var(--qmp-accent); font-weight: 600; }\n.dsh-qmp .dsh-qmp-team-toggle { display: flex; width: 100%; min-height: 36px; gap: 12px; align-items: center; justify-content: space-between; padding: 4px 6px; border-radius: 7px; }\n.dsh-qmp .dsh-qmp-team-toggle:hover:not(:disabled) { background: var(--qmp-hover); }\n.dsh-qmp-team-label { font-size: 12px; font-weight: 500; }\n.dsh-qmp-switch-track { position: relative; display: block; flex: 0 0 30px; width: 30px; height: 18px; padding: 3px; border-radius: 99px; corner-shape: round; background: color-mix(in srgb, var(--qmp-fg) 24%, var(--qmp-bg)); transition: background-color 120ms ease; }\n.dsh-qmp-switch-thumb { display: block; width: 12px; height: 12px; border-radius: 50%; corner-shape: round; background: var(--dsw-alias-switch-thumb, Canvas); box-shadow: var(--dsw-shadow-lv1, none); }\n.dsh-qmp-team-toggle[aria-checked=\"true\"] .dsh-qmp-switch-track { background: var(--qmp-accent); }\n.dsh-qmp-team-toggle[aria-checked=\"true\"] .dsh-qmp-switch-thumb { margin-inline-start: 12px; background: var(--dsw-alias-label-on-color, Canvas); }\n.dsh-qmp-team-confirm { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; padding: 9px; border-radius: 7px; background: var(--qmp-surface); }\n.dsh-qmp-team-confirm p { width: 100%; margin: 0 0 3px; color: var(--qmp-muted); font-size: 12px; }\n.dsh-qmp-team-confirm button { padding: 5px 8px; border-radius: 5px; background: var(--qmp-bg); font-size: 12px; }\n.dsh-qmp-team-confirm button:hover { box-shadow: 0 0 0 1px var(--qmp-border); }\n/* 设置和全部模型同为右侧 Portal；主面板完全不承载设置内容，避免高度伸缩。 */\n.dsh-qmp-settings-panel { display: flex; flex-direction: column; padding: 14px 10px 10px; overflow-y: auto; overscroll-behavior: contain; }\n.dsh-qmp-settings-fields { display: grid; gap: 18px; padding: 2px 4px 4px; }\n.dsh-qmp-settings-section { min-width: 0; }\n.dsh-qmp-settings-section + .dsh-qmp-settings-section { border-top: 1px solid var(--qmp-border); padding-top: 14px; }\n.dsh-qmp-settings-section h3 { margin: 0 0 8px; color: var(--qmp-muted); font-size: 12px; font-weight: 500; }\n.dsh-qmp-radio-group { display: grid; gap: 3px; }\n.dsh-qmp-radio-option { display: flex; align-items: center; gap: 9px; min-height: 37px; padding: 5px 8px; border-radius: 7px; cursor: pointer; font-size: 13px; }\n.dsh-qmp-radio-option:hover { background: var(--qmp-hover); }\n.dsh-qmp-radio-option:has(input:checked) { background: var(--qmp-selected); color: var(--qmp-accent); }\n.dsh-qmp .dsh-qmp-radio-option input[type=\"radio\"] { appearance: auto; -webkit-appearance: auto; flex: 0 0 auto; width: 16px; height: 16px; accent-color: var(--qmp-accent); cursor: pointer; }\n.dsh-qmp-radio-option:has(input:focus-visible) { outline: 2px solid var(--qmp-accent); outline-offset: -2px; }\n.dsh-qmp-settings-panel .dsh-qmp-section-heading { margin-inline: 0; }\n.dsh-qmp-settings-help, .dsh-qmp-settings-feedback { margin: 0; color: var(--qmp-muted); font-size: 11px; line-height: 16px; }\n.dsh-qmp-settings-feedback:empty { display: none; }\n.dsh-qmp-settings-feedback[role=\"alert\"] { color: var(--qmp-fg); }\n.dsh-qmp-hint { color: var(--qmp-muted); font-size: 12px; line-height: 20px; margin: 10px 7px; }\n.dsh-qmp-status { flex: 1; min-width: 0; text-align: end; color: var(--qmp-muted); font-size: 12px; line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n/* 很快完成的会话写入无需闪出一帧“正在保存”；长请求仍有可见反馈，不改变标题栏几何。 */\n.dsh-qmp-status.is-saving { animation: dsh-qmp-saving 1ms linear 160ms backwards; }\n@keyframes dsh-qmp-saving { from { opacity: 0; } to { opacity: 1; } }\n.dsh-qmp-error { display: flex; gap: 6px; align-items: center; height: 36px; margin: 5px 4px 0; padding: 5px 7px; border-radius: 6px; background: var(--qmp-surface); font-size: 12px; line-height: 16px; }\n.dsh-qmp-error span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n/* 右列高度/位置是独立视口预算，不继承收藏内容高度，也不做位置动画。 */\n.dsh-qmp-search { display: flex; flex-direction: column; padding: 14px 10px 10px; }\n.dsh-qmp-search .dsh-qmp-header { flex: 0 0 28px; margin-bottom: 10px; }\n.dsh-qmp-query-wrap { position: relative; flex: 0 0 36px; margin: 0 4px; }\n.dsh-qmp-query-wrap::before { content: ''; pointer-events: none; position: absolute; width: 16px; height: 16px; inset-inline-start: 10px; top: 10px; background: var(--qmp-muted); mask: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5'%3E%3Ccircle cx='6.8' cy='6.8' r='4.5'/%3E%3Cpath d='m10.2 10.2 3.5 3.5'/%3E%3C/svg%3E\") center / contain no-repeat; }\n.dsh-qmp .dsh-qmp-query { display: block; width: 100%; height: 36px; padding: 8px 10px 8px 33px; border: 0; border-radius: 7px; color: var(--qmp-fg); background: var(--qmp-surface); font-size: 12px; line-height: 20px; }\n.dsh-qmp-query::placeholder { color: var(--qmp-muted); opacity: 1; }\n.dsh-qmp-query::-webkit-search-decoration { -webkit-appearance: none; }\n.dsh-qmp-query::-webkit-search-cancel-button { cursor: pointer; }\n.dsh-qmp-results { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin-top: 10px; }\n.dsh-qmp-replace { padding: 9px; margin: 10px 4px 0; border-radius: 8px; background: var(--qmp-surface); max-height: 48%; overflow-y: auto; flex-shrink: 0; font-size: 12px; line-height: 17px; }\n.dsh-qmp-replace p { margin: 0 0 6px; font-weight: 500; }\n.dsh-qmp .dsh-qmp-replace-option { display: block; width: 100%; text-align: start; border-radius: 5px; margin: 3px 0; padding: 6px 7px; overflow-wrap: anywhere; }\n.dsh-qmp-replace-option:hover { color: var(--qmp-accent); background: var(--qmp-selected); }\n/* 渠道使用实体底色、强调边与标题层级，滚动时保留所属渠道；不靠微小副标题区分。 */\n.dsh-qmp-channel { margin: 0 2px 14px; border: 1px solid var(--qmp-border); border-radius: 9px; }\n.dsh-qmp-channel:last-child { margin-bottom: 2px; }\n.dsh-qmp-channel-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 9px; border-inline-start: 3px solid var(--qmp-accent); border-bottom: 1px solid var(--qmp-border); border-radius: 8px 8px 0 0; background: var(--qmp-surface); }\n.dsh-qmp-channel-badge { flex: 0 0 auto; color: var(--qmp-accent); background: var(--qmp-selected); padding: 4px; border-radius: 5px; font-size: 10px; font-weight: 700; }\n.dsh-qmp-channel-name { display: flex; flex: 1; flex-direction: column; min-width: 0; }\n.dsh-qmp-channel-name strong { font-size: 14px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-channel-name > span { color: var(--qmp-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.dsh-qmp-channel-count { flex: 0 0 auto; min-width: 24px; padding: 2px 5px; border-radius: 5px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--qmp-fg); background: var(--qmp-bg); }\n.dsh-qmp-channel > .dsh-qmp-row { margin: 3px; }\n.dsh-qmp-channel-filter { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; margin: 8px 4px 0; font-size: 12px; color: var(--qmp-muted); }\n.dsh-qmp-channel-filter > span { flex: 0 0 auto; }\n.dsh-qmp-channel-filter select { font: inherit; color: var(--qmp-fg); background: var(--qmp-surface); min-width: 0; flex: 1; height: 30px; border: 1px solid var(--qmp-border); border-radius: 6px; padding: 3px 6px; }\n.dsh-qmp-channel-filter select:focus-visible { outline: 2px solid var(--qmp-accent); outline-offset: 1px; }\n/* 排序手柄与选模型、星标三者热区分离；插入线不占位，不因拖动重排触发误点。 */\n.dsh-qmp .dsh-qmp-drag { flex: 0 0 26px; width: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: var(--qmp-muted); cursor: grab; touch-action: none; user-select: none; }\n.dsh-qmp .dsh-qmp-drag:hover { background: var(--qmp-hover); color: var(--qmp-fg); }\n.dsh-qmp .is-dragging .dsh-qmp-drag { cursor: grabbing; color: var(--qmp-accent); }\n.dsh-qmp-row.is-dragging { outline: 1px dashed var(--qmp-accent); outline-offset: -1px; }\n.dsh-qmp-row.drop-before { box-shadow: 0 -2px 0 var(--qmp-accent); }\n.dsh-qmp-row.drop-after { box-shadow: 0 2px 0 var(--qmp-accent); }\n.dsh-qmp-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }\n@media (max-width: 420px) {\n  .dsh-qmp-primary, .dsh-qmp-search, .dsh-qmp-settings-panel { padding: 10px 8px 8px; }\n  .dsh-qmp .dsh-qmp-star { flex-basis: 40px; width: 40px; height: 40px; }\n  .dsh-qmp .dsh-qmp-icon { width: 32px; height: 32px; }\n  .dsh-qmp .dsh-qmp-query { font-size: 16px; }\n}\n@media (prefers-reduced-motion: reduce) { .dsh-qmp button, .dsh-qmp-switch-track { transition: none; } .dsh-qmp-status.is-saving { animation: none; } }\n@media (forced-colors: active) {\n  .dsh-qmp-panel, .dsh-qmp-search, .dsh-qmp-settings-panel { outline: 1px solid CanvasText; }\n  .dsh-qmp-row.is-current { outline: 1px solid Highlight; outline-offset: -1px; }\n  .dsh-qmp .dsh-qmp-star[aria-pressed=\"true\"] { color: Highlight; }\n  .dsh-qmp-switch-track { outline: 1px solid ButtonText; }\n  .dsh-qmp-switch-thumb { background: ButtonText; }\n  .dsh-qmp-range::-webkit-slider-runnable-track { background: ButtonText; }\n  .dsh-qmp-range::-webkit-slider-thumb { background: Highlight; border-color: Canvas; }\n}\n");
   }
 });

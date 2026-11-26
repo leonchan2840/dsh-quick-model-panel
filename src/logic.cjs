@@ -41,7 +41,7 @@ function levelsFor(model) {
   return result;
 }
 
-// 显示当前档与切换模型共用同一规则，避免滑块显示和提交参数分别维护而漂移。
+// 展示档位时区分已保存的档位和当前模型声明的默认档位。
 function resolveEffort(model, currentEffort) {
   const levels = levelsFor(model);
   const supports = id => levels.some(level => level.id === id);
@@ -50,13 +50,21 @@ function resolveEffort(model, currentEffort) {
   return { levels, fallback, effective: supports(currentEffort) ? currentEffort : fallback };
 }
 
-function selectionFor(model, currentEffort) {
+function selectionFor(model, preferredEffort) {
   const pair = pairOf(model);
   if (!pair) throw new TypeError('A model requires non-empty provider and id');
-  const { effective } = resolveEffort(model, currentEffort);
-  // 无显式默认档时留给 provider；不能将列表第一档伪造为默认档。
-  return { provider: pair.provider, model: pair.id,
-    ...(effective === undefined ? {} : { reasoningEffort: effective }) };
+  // 跨模型偏好只在目标模型支持时覆盖；否则提交目标模型声明的有效默认档，与原生选模型一致。
+  const { effective } = resolveEffort(model, preferredEffort);
+  return { provider: pair.provider, model: pair.id, ...(effective === undefined ? {} : { reasoningEffort: effective }) };
+}
+
+function effortOptions(models) {
+  const options = new Map();
+  for (const model of models) for (const level of levelsFor(model)) {
+    // ID 是 DSH 的真实档位标识；跨渠道同一个 ID 只出现一次。
+    if (!options.has(level.id)) options.set(level.id, level);
+  }
+  return [...options.values()];
 }
 
 /**
@@ -156,4 +164,4 @@ function createFavorites(storage, key = FAVORITES_KEY) {
   };
 }
 
-module.exports = { FAVORITES_KEY, MAX_FAVORITES, normalizeModels, levelsFor, resolveEffort, selectionFor, createFavorites };
+module.exports = { FAVORITES_KEY, MAX_FAVORITES, normalizeModels, levelsFor, resolveEffort, selectionFor, effortOptions, createFavorites };

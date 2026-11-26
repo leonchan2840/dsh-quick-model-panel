@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const vm = require('node:vm');
 const root = path.join(__dirname, '..');
@@ -38,15 +39,22 @@ test('build reads the manifest name instead of baking a local package scope into
   assert.ok(!result.includes('@local/dsh-quick-model-panel'));
 });
 
-test('release includes real screenshot resources and no installation lifecycle scripts or dependencies', () => {
+test('release includes real screenshot resources and no installation lifecycle scripts', () => {
   assert.equal(pkg.publishConfig.access, 'public');
   assert.equal(pkg.publishConfig.registry, 'https://registry.npmjs.org/');
   for (const name of ['preinstall', 'install', 'postinstall', 'prepare']) assert.equal(pkg.scripts[name], undefined);
-  assert.equal(pkg.dependencies, undefined);
-  for (const file of ['model-panel-overview.png', 'quick-panel.png']) {
+  assert.deepEqual(pkg.dependencies, { '@deepseek-ai/schemastery': '3.19.0' });
+  // 用户要求原图完整使用：固定上传文件哈希，避免以后无意裁切或重编码。
+  const screenshotHashes = {
+    'panel-overview-1.3.jpg': '2ac49956b3c50ec942ab5235dc4c06bda4538dd2c990401356b5ce6046e2ac1f',
+    'settings-1.3.jpg': '80dfc77f7f4295bc56e97e3bbc814444a89a0c4cd3aa7344d99f021ce933236e',
+    'all-models-1.3.jpg': '03b6c4c0962c495d5b59032b3ea1ed89d7348eb118fb176cc1e119ee0cf7ac7e',
+  };
+  for (const [file, expectedHash] of Object.entries(screenshotHashes)) {
     const relative = 'docs/images/' + file;
     const bytes = fs.readFileSync(path.join(root, relative));
-    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.equal(bytes.subarray(0, 3).toString('hex'), 'ffd8ff');
+    assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), expectedHash);
     assert.ok(read('README.md').includes('./' + relative));
   }
   for (const name of ['README.md', 'SECURITY.md']) assert.ok(!read(name).includes('保留 `private: true`'));

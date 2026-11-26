@@ -3,7 +3,6 @@
 const NS = 'quick-model-panel';
 const SEAT = 'conversation.input.model';
 const same = (selection, model) => !!selection && !!model && selection.provider === model.provider && selection.model === model.id;
-const describe = error => error?.message || String(error);
 
 // 未声明默认档时，“提供方默认”表示省略参数，不等同于最低档。
 function effortState(model, selection, resolveEffort, defaultLabel) {
@@ -36,9 +35,86 @@ function teamDecision(mode, history, to, confirmed) {
   return !to && history.lastUsed !== null && !confirmed ? 'confirm' : 'write';
 }
 
-function createPlugin(React, createPortal, { createView, normalizeModels, resolveEffort, selectionFor, createFavorites, MAX_FAVORITES, FAVORITES_KEY }, dictionaries, css) {
-  const h = React.createElement, { useState, useRef, useEffect, useMemo, useSyncExternalStore } = React;
+function createPlugin(React, createPortal, { createView, normalizeModels, resolveEffort, selectionFor, effortOptions, createFavorites, MAX_FAVORITES, FAVORITES_KEY }, dictionaries, css) {
+  const h = React.createElement, { useId, useState, useRef, useEffect, useMemo, useSyncExternalStore } = React;
   const View = createView(React, createPortal);
+  function SettingsControl({ form, options, t }) {
+    const id = useId();
+    const [saving, setSaving] = useState(false), [failed, setFailed] = useState(false);
+    const active = useRef(false), draftRef = useRef(0), editing = useRef(false), returnFocus = useRef(null);
+    // 保存中会暂时禁用输入；先把焦点交给可聚焦的设置层，避免浏览器把它丢到页面 body。
+    useEffect(() => {
+      if (saving || !returnFocus.current) return;
+      const { scope, input } = returnFocus.current;
+      returnFocus.current = null;
+      if (!scope.isConnected || scope.ownerDocument.activeElement !== scope) return;
+      // 保存失败会把单选框恢复为旧值；不可把焦点放回已不在原生 Tab 顺序中的未选项。
+      const target = input.type === 'radio' && !input.checked
+        ? [...scope.querySelectorAll('input[type="radio"]')].find(el => el.name === input.name && el.checked && !el.disabled)
+        : input;
+      if (target?.isConnected && !target.disabled) target.focus({ preventScroll: true });
+    }, [saving]);
+    const watch = useMemo(() => ({ subscribe: fn => form.subscribe(fn), snapshot: () => form.getSnapshot() }), [form]);
+    const { status, value, writable } = useSyncExternalStore(watch.subscribe, watch.snapshot);
+    const enabled = status === 'ready' && writable;
+    const savedEffort = value?.defaultEffort ?? '';
+    // 复用当前深度的 range 与刻度样式，但这里提交的是未来会话的配置，不改当前会话。
+    const inheritLabel = t('host.inherit');
+    const levels = useMemo(() => [{ id: '', label: inheritLabel },
+      ...(savedEffort && !options.some(level => level.id === savedEffort) ? [{ id: savedEffort, label: savedEffort }] : []), ...options], [options, savedEffort, inheritLabel]);
+    const savedIndex = Math.max(0, levels.findIndex(level => level.id === savedEffort));
+    const [preview, setPreview] = useState(savedIndex);
+    useEffect(() => { editing.current = false; draftRef.current = savedIndex; setPreview(savedIndex); }, [savedIndex, levels]);
+    const index = Math.max(0, Math.min(levels.length - 1, preview));
+    async function save(field, next) {
+      if (!enabled || active.current) return false;
+      active.current = true;
+      const input = typeof document !== 'undefined' ? document.activeElement : null;
+      const scope = input?.closest?.('.dsh-qmp-settings-panel');
+      if (scope && (input?.type === 'radio' || input?.type === 'range')) {
+        returnFocus.current = { scope, input };
+        scope.focus({ preventScroll: true });
+      }
+      setSaving(true); setFailed(false);
+      try { const ok = await form.set(field, next); setFailed(!ok); return ok; }
+      catch { setFailed(true); return false; }
+      finally { active.current = false; setSaving(false); }
+    }
+    function commit() {
+      if (!editing.current) return;
+      editing.current = false;
+      const next = levels[draftRef.current];
+      if (!enabled || active.current || !next || next.id === savedEffort) { setPreview(savedIndex); return; }
+      // 只让表单权威快照驱动成功态；目录变化时旧异步回调不能用旧索引重绘刻度。
+      void save('defaultEffort', next.id).then(ok => { if (!ok && !editing.current) setPreview(savedIndex); });
+    }
+    return h('div', { className: 'dsh-qmp-settings-fields' },
+      h('section', { className: 'dsh-qmp-settings-section' },
+        h('h3', { id: id + '-team' }, t('host.settingsTeam')),
+        h('div', { className: 'dsh-qmp-radio-group', role: 'radiogroup', 'aria-labelledby': id + '-team' },
+          [['on', t('host.on')], ['off', t('host.off')], ['inherit', t('host.inherit')]].map(([option, label]) =>
+            h('label', { className: 'dsh-qmp-radio-option', key: option },
+              h('input', { type: 'radio', name: id + '-team', value: option,
+                checked: (value?.newSessionTeam ?? 'inherit') === option, disabled: !enabled || saving,
+                onChange: () => { if (!active.current) void save('newSessionTeam', option); } }), h('span', null, label))))),
+      h('section', { className: 'dsh-qmp-settings-section' },
+        h('div', { className: 'dsh-qmp-section-heading' },
+          h('label', { id: id + '-effort', htmlFor: id + '-range' }, t('host.settingsEffort')),
+          h('output', { className: 'dsh-qmp-effort-value', htmlFor: id + '-range' }, levels[index].label)),
+        h('input', { id: id + '-range', className: 'dsh-qmp-range', type: 'range', min: 0, max: levels.length - 1,
+          step: 1, value: index, disabled: !enabled || saving || levels.length < 2,
+          'aria-valuetext': levels[index].label, onChange: e => {
+            if (active.current) return;
+            editing.current = true; draftRef.current = Number(e.target.value); setPreview(draftRef.current);
+          }, onPointerDown: e => e.currentTarget.setPointerCapture?.(e.pointerId),
+          onPointerUp: commit, onPointerCancel: () => { editing.current = false; setPreview(savedIndex); },
+          onBlur: commit, onKeyUp: e => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown'].includes(e.key)) commit(); } }),
+        h('div', { className: 'dsh-qmp-range-labels', 'aria-hidden': true }, levels.map((level, i) =>
+          h('span', { key: level.id, className: i === index ? 'is-active' : '' }, level.label)))),
+      h('p', { className: 'dsh-qmp-settings-help' }, t('host.settingsHelp')),
+      failed ? h('p', { className: 'dsh-qmp-settings-feedback', role: 'alert' }, t('host.failed')) :
+        h('p', { className: 'dsh-qmp-settings-feedback', role: 'status' }, saving ? t('qmp.saving') : status === 'loading' ? t('qmp.loading') : !enabled ? t('host.settingsUnavailable') : ''));
+  }
   function TeamControl({ mode, locked, pending, t, change }) {
     const [confirm, setConfirm] = useState(false);
     useEffect(() => { if (!mode.enabled) setConfirm(false); }, [mode.enabled]);
@@ -64,7 +140,7 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     const listedChild = props.useSessions(s => s.byId[props.sessionId]?.origin === 'subagent');
     return child || listedChild || !props.isRoot() ? null : h(Root, { ...props, key: props.sessionId });
   }
-  function Root({ dir, isRoot, setTeam, favStore, t, useProjection, locked }) {
+  function Root({ dir, isRoot, setTeam, favStore, settingsForm, t, useProjection, locked }) {
     const connection = useMemo(() => ({ subscribe: fn => dir.store.subscribe(fn), snapshot: () => dir.store.getSnapshot() }), [dir]);
     const state = useSyncExternalStore(connection.subscribe, connection.snapshot);
     const mode = useProjection('agentTeam'), history = useProjection('modelSelection');
@@ -82,7 +158,7 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     latest.current = { locked, mode, history };
     function reload() {
       if (!isRoot()) return;
-      setError(''); void dir.load().catch(err => { if (alive.current) setError(describe(err)); });
+      setError(''); void dir.load().catch(() => { if (alive.current) setError(t('qmp.operationFailed')); });
     }
     useEffect(() => { alive.current = true; reload(); return () => { alive.current = false; }; }, [dir]);
     function initialize(selection) {
@@ -101,9 +177,9 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
       gate.current = true; setPending(true); setError('');
       try {
         const res = await action();
-        if (!res?.ok) throw new Error(res?.error?.message || t('host.failed'));
+        if (!res?.ok) throw new Error('operation failed');
         return true;
-      } catch (err) { if (alive.current) setError(describe(err)); return false; }
+      } catch { if (alive.current) setError(t('qmp.operationFailed')); return false; }
       finally { gate.current = false; if (alive.current) setPending(false); }
     }
     function onSelect(model) {
@@ -111,9 +187,9 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
       const exact = catalog.find(m => m.provider === model.provider && m.id === model.id);
       if (!exact) return false;
       if (same(now.current, exact)) return true;
-      const oldModel = catalog.find(m => same(now.current, m));
-      const oldEffort = oldModel ? effortState(oldModel, now.current, resolveEffort, '').effective : now.current?.reasoningEffort;
-      return write(() => dir.select(selectionFor(exact, oldEffort)));
+      // 官方切模型不继承旧档；仅在用户明确设置了跨模型默认档时尝试匹配目标模型。
+      const preferred = settingsForm.getSnapshot().status === 'ready' ? settingsForm.getSnapshot().value?.defaultEffort : undefined;
+      return write(() => dir.select(selectionFor(exact, preferred)));
     }
     function onEffort(index) {
       const level = effort.levels[index], now = dir.store.getSnapshot();
@@ -141,14 +217,19 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     }
     const teamNode = mode && typeof mode.enabled === 'boolean' ? h(TeamControl, { mode, t,
       locked: !!locked || history?.lastUsed === undefined, pending: remotePending, change: changeTeam }) : null;
-    const failures = state.failures.map(f => f.name + ': ' + f.message).join('; ');
+    // 提供方错误可能包含私有 URL 或鉴权字段；面板只显示固定文案，不回显异常原文。
+    const failures = state.failures?.length ? t('qmp.operationFailed') : '';
+    const options = useMemo(() => effortOptions(models), [models]);
+    const settingsNode = h(SettingsControl, { form: settingsForm, options, t });
     return h(View, { t, modelName: selected?.name || current?.model, models, current, favs, levels: effort.levels,
-      effortIndex: effort.index, maxFavorites: MAX_FAVORITES, onOpen, onStar, onMove, onSelect, onEffort, teamNode,
-      locked: !!locked, pending: remotePending, error: error || state.error || failures, reload, loading: state.status === 'loading' });
+      effortIndex: effort.index, maxFavorites: MAX_FAVORITES, onOpen, onStar, onMove, onSelect, onEffort, teamNode, settingsNode,
+      locked: !!locked, pending: remotePending, error: error || (state.error ? t('host.failed') : '') || failures, reload, loading: state.status === 'loading' });
   }
-  return { inject: ['slots', 'locale', 'sessions', 'modelDirectories', 'remote', 'remote.agentTeams'], apply(ctx) {
+  return { inject: ['slots', 'locale', 'sessions', 'modelDirectories', 'configForms', 'remote', 'remote.agentTeams'], apply(ctx) {
     ctx.effect(() => ctx.locale.register(NS, dictionaries), 'quick-model-panel: locale');
     const favStore = sharedFavorites({ getItem: k => window.localStorage.getItem(k), setItem: (k,v) => window.localStorage.setItem(k,v) }, createFavorites);
+    const form = ctx.configForms.get(NS);
+    const settingsForm = { subscribe: fn => form.subscribe(fn), getSnapshot: () => form.getSnapshot(), set: (field, value) => form.set(field, value) };
     ctx.effect(() => {
       const listener = e => { if (e.key === FAVORITES_KEY || e.key === null) favStore.refresh(); };
       window.addEventListener('storage', listener); return () => window.removeEventListener('storage', listener);
@@ -156,7 +237,7 @@ function createPlugin(React, createPortal, { createView, normalizeModels, resolv
     function StyledSeat(props) { return h(React.Fragment, null, h('style', null, css), h(Seat, props)); }
     ctx.slots.inject(SEAT, () => ctx.slots.register({ name: SEAT, locale: NS, priority: -100,
       inject: sid => ({ dir: ctx.modelDirectories.directoryFor(sid), isRoot: () => ctx.sessions.subagentAddress(sid) === undefined,
-        setTeam: enabled => ctx.remote.agentTeams.setEnabled(sid, enabled), favStore }) }, StyledSeat));
+        setTeam: enabled => ctx.remote.agentTeams.setEnabled(sid, enabled), favStore, settingsForm }) }, StyledSeat));
   } };
 }
 module.exports = { createPlugin, effortState, sharedFavorites, teamDecision };
